@@ -32,7 +32,7 @@ from tune_quantization import _bump_fd_limit, _suggest_quant_config
 from utils.quant_bits import compute_quantization_bits
 
 # Real (non-baseline) methods `_suggest_quant_config` knows how to rebuild.
-_ALL_METHODS = ["momos2d", "qat", "hierarchical_momos2d"]
+_ALL_METHODS = ["momos2d", "qat", "hierarchical_momos2d", "soft_momos"]
 
 _NO_QUANT_METHOD_NAMES = {None, "none", "None", "null", ""}
 
@@ -116,6 +116,9 @@ def _reconstruct_quant_cfg(params: dict, search_space: DictConfig) -> dict:
             p.cols = _ensure_categorical_choices(p.cols, params["hm_p_cols"])
             s.rows = _ensure_categorical_choices(s.rows, params["hm_s_rows"])
             s.cols = _ensure_categorical_choices(s.cols, params["hm_s_cols"])
+        elif method == "soft_momos":
+            space.soft_momos.rows = _ensure_categorical_choices(space.soft_momos.rows, params["sm_rows"])
+            space.soft_momos.cols = _ensure_categorical_choices(space.soft_momos.cols, params["sm_cols"])
         else:
             raise ValueError(
                 f"Unsupported quantization method in pareto entry params: {method!r} "

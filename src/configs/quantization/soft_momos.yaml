@@ -1,0 +1,33 @@
+enabled: true
+method: soft_momos
+
+rows: 1
+cols: 2
+
+# Motifs in the per-epoch training mosaic: absolute k, or capacity (fraction of
+# blocks) when k is null.
+k: 256
+capacity: null
+
+# Codebook size stored after training (k-means++ on all blocks); this is what
+# the bit accounting uses.
+final_k: 256
+
+force_zero: true
+
+# Penalty weight on the mean squared deviation of each block from its group
+# mean, linearly ramped over the first lam_warmup_fraction of the epochs.
+lam: 1.0
+lam_warmup_fraction: 0.0
+
+# Validate on Z[M] (raw weights are restored right after) instead of raw weights.
+validate_projected: true
+
+# Post-training k-means++ (run once on the best checkpoint before val/test).
+finalize:
+  backend: minibatch   # minibatch | exact
+  max_iter: 100
+  n_init: auto
+  seed: ${seed}
+
+chunk_size: null

@@ -121,3 +121,73 @@ def test_compute_quantization_bits_fold_momos_requires_primary_k_or_capacity():
                 "q_bits": 32,
             },
         )
+
+
+def test_compute_quantization_bits_soft_momos_uses_final_k_codebook():
+    model = DummyModel()
+    # 512 params, 4x4 = 16-size blocks -> 32 blocks, counted with the same flat
+    # sum(ceil(numel / s)) rule as the momos2d branch so the two methods are
+    # directly comparable on the Pareto plot. The stored codebook is the
+    # post-training k-means++ one with final_k entries -- the training-time k
+    # (mosaic draw) is NOT stored.
+    # motif bits = 256 * 16 * 32 = 131072; index bits = 32 * ceil(log2 256) = 256.
+    res = compute_quantization_bits(
+        model,
+        {
+            "enabled": True,
+            "method": "soft_momos",
+            "rows": 4,
+            "cols": 4,
+            "k": 8,
+            "final_k": 256,
+            "q_bits": 32,
+        },
+    )
+    assert res["num_parameters"] == 512
+    assert res["motif_bits"] == 131072.0
+    assert res["index_bits"] == 256.0
+    assert res["compressed_bits"] == 131328.0
+    assert res["compression_rate"] == (512 * 32) / 131328.0
+    assert res["bpp"] == 131328.0 / 512
+    assert "iota_bits" not in res
+
+
+def test_compute_quantization_bits_soft_momos_ignores_training_k_and_capacity():
+    model = DummyModel()
+    # final_k = 16 -> motif bits 16 * 16 * 32 = 8192; index bits 32 * 4 = 128,
+    # regardless of the (much larger) training k / capacity.
+    for extra in ({"k": 1000}, {"capacity": 1.0}, {}):
+        res = compute_quantization_bits(
+            model,
+            {
+                "enabled": True,
+                "method": "soft_momos",
+                "rows": 4,
+                "cols": 4,
+                "final_k": 16,
+                "q_bits": 32,
+                **extra,
+            },
+        )
+        assert res["motif_bits"] == 8192.0
+        assert res["index_bits"] == 128.0
+        assert res["compressed_bits"] == 8320.0
+
+
+def test_compute_quantization_bits_soft_momos_q_bits_scales_motif_bits_only():
+    model = DummyModel()
+    res = compute_quantization_bits(
+        model,
+        {"enabled": True, "method": "soft_momos", "rows": 4, "cols": 4, "final_k": 16, "q_bits": 8},
+    )
+    assert res["motif_bits"] == 16 * 16 * 8
+    assert res["index_bits"] == 128.0
+
+
+def test_compute_quantization_bits_soft_momos_requires_final_k():
+    model = DummyModel()
+    with pytest.raises(ValueError):
+        compute_quantization_bits(
+            model,
+            {"enabled": True, "method": "soft_momos", "rows": 4, "cols": 4, "k": 8, "q_bits": 32},
+        )

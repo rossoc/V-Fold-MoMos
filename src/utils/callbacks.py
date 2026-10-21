@@ -1,8 +1,10 @@
 """Lightning callbacks for quantization-aware training and MoMos projection."""
 
 import math
+import os
 
 import lightning as L
+import torch
 from lightning.pytorch.callbacks import (
     EarlyStopping,
     ModelCheckpoint,
@@ -13,6 +15,11 @@ from omegaconf import OmegaConf
 
 from quantizers import quantize_qat, k_from_capacity, quantize
 from quantizers.block_utils import iter_trainable_params
+from quantizers.soft_momos import (
+    draw_mosaic,
+    project_fixed_mosaic,
+    soft_momos_penalty,
+)
 from utils.metrics import compute_metrics, resolve_block_shape
 
 
@@ -77,6 +84,20 @@ def _fold_bit_estimate(n, k, s, q):
     }
 
 
+def _log_bits_hyperparams(pl_module, est, baseline):
+    """Log a ``*_bit_estimate`` dict (``<name>_bits`` keys) as ``bits/<name>`` hparams."""
+    logger = getattr(pl_module, "logger", None)
+    if logger is None or not hasattr(logger, "log_hyperparams"):
+        return
+    params = {f"bits/{key.removesuffix('_bits')}": v for key, v in est.items()}
+    params["bits/dense"] = baseline
+    params["bits/ratio"] = est["total_bits"] / baseline
+    try:
+        logger.log_hyperparams(params)
+    except Exception:
+        pass
+
+
 class QuantizationCallback(L.Callback):
     """Callback that handles QAT setup and MoMos projection during training.
 
@@ -109,9 +130,23 @@ class QuantizationCallback(L.Callback):
         # Stats from the most recent MoMos projection, logged in
         # on_validation_epoch_end (projection runs in on_validation_epoch_start).
         self._last_quant_stats: dict | None = None
+        # soft_momos state: the current epoch's mosaic (and its bincount, which
+        # only depends on M), the penalty weight in effect, whether the final
+        # k-means++ snap has run, and the raw weights stashed while validating
+        # on the projection.
+        self.M = None
+        self.finalized = False
+        self.current_lam = float(quant_cfg.get("lam", 0.0))
+        self._counts = None
+        self._raw_params: list | None = None
+        self._aux_fn = None
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
         """Set up QAT parametrizations before training begins."""
+        if self.method == "soft_momos":
+            self._setup_soft_momos(pl_module)
+            return
+
         if self.method == "hierarchical_momos2d":
             self._log_hierarchical_bit_estimate(pl_module)
             return
@@ -139,6 +174,146 @@ class QuantizationCallback(L.Callback):
             print(
                 f"QAT disabled (bitwidth >= 32): disabled_modules={stats.get('disabled_modules', 0)}"
             )
+
+    def _setup_soft_momos(self, pl_module: L.LightningModule):
+        """Resolve k, register the penalty (once) and log the final bit estimate."""
+        model = pl_module.model
+        cfg = self.quant_cfg
+        s = int(cfg["s"])
+        if cfg.get("k") is None:
+            cfg["k"] = k_from_capacity(model, s, cfg["capacity"])
+        rows, cols = int(cfg["rows"]), int(cfg["cols"])
+        k, force_zero = int(cfg["k"]), bool(cfg.get("force_zero", True))
+
+        if self._aux_fn is None:
+
+            def penalty(m):
+                return self.current_lam * soft_momos_penalty(
+                    m, self.M, rows, cols, k, force_zero,
+                    counts=self._counts, with_stats=False,
+                )[0]
+
+            self._aux_fn = penalty
+        if self._aux_fn not in pl_module.aux_losses:
+            pl_module.aux_losses.append(self._aux_fn)
+
+        q = int(cfg.get("q_bits", 32))
+        n = sum(p.numel() for p in iter_trainable_params(model))
+        est = _fold_bit_estimate(n, int(cfg["final_k"]), s, q)
+        baseline = n * q
+        print(
+            f"Soft MoMos bit estimate (q={q}, n={n}, k={k}, final_k={cfg['final_k']}, "
+            f"s={s}): motif={est['motif_bits']}, mosaic={est['mosaic_bits']}, "
+            f"total={est['total_bits']} "
+            f"({est['total_bits'] / baseline:.4%} of dense {baseline} bits)"
+        )
+        _log_bits_hyperparams(pl_module, est, baseline)
+
+    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
+        """soft_momos: draw a new mosaic from the current weights, update lam."""
+        if self.method != "soft_momos":
+            return
+        cfg = self.quant_cfg
+        self.M = draw_mosaic(
+            pl_module.model,
+            cfg["rows"],
+            cfg["cols"],
+            cfg["k"],
+            cfg.get("force_zero", True),
+            cfg.get("chunk_size"),
+        )[0]
+        self._counts = torch.bincount(self.M, minlength=int(cfg["k"]))
+        warmup = float(cfg.get("lam_warmup_fraction", 0.0)) * (trainer.max_epochs or 1)
+        ramp = min(1.0, trainer.current_epoch / warmup) if warmup > 0 else 1.0
+        self.current_lam = float(cfg["lam"]) * ramp
+
+    def _soft_validation_start(self, pl_module: L.LightningModule):
+        """Record penalty stats on the raw weights, then optionally project to Z[M]."""
+        if self.M is None:
+            return
+        cfg = self.quant_cfg
+        rows, cols, k = int(cfg["rows"]), int(cfg["cols"]), int(cfg["k"])
+        force_zero = bool(cfg.get("force_zero", True))
+        with torch.no_grad():
+            _, stats = soft_momos_penalty(
+                pl_module.model, self.M, rows, cols, k, force_zero, counts=self._counts
+            )
+        stats = {name: float(v) for name, v in stats.items()}
+        stats["lam"] = float(self.current_lam)
+        if cfg.get("validate_projected", True):
+            self._raw_params = [
+                p.detach().clone() for p in iter_trainable_params(pl_module.model)
+            ]
+            stats.update(
+                project_fixed_mosaic(pl_module.model, self.M, rows, cols, k, force_zero)
+            )
+        self._last_quant_stats = stats
+
+    def _restore_raw_params(self, pl_module: L.LightningModule):
+        if self._raw_params is None:
+            return
+        with torch.no_grad():
+            for p, raw in zip(
+                iter_trainable_params(pl_module.model), self._raw_params
+            ):
+                p.copy_(raw)
+        self._raw_params = None
+
+    def _finalize_soft_momos(self, trainer, pl_module, fn: TrainerFn):
+        """Snap the model to final_k motifs once, when entering validate/test."""
+        if self.method != "soft_momos" or self.finalized or trainer.state.fn != fn:
+            return
+        stats = quantize(pl_module.model, self.quant_cfg)
+        self.finalized = True
+        pl_module.log("quant/final_distortion", stats["distortion"])
+        pl_module.log("quant/final_num_motifs_used", float(stats["num_motifs_used"]))
+        print(
+            f"Soft MoMos finalized: distortion={stats['distortion']:.4f}, "
+            f"motifs used={stats['num_motifs_used']}"
+        )
+        dirpath = getattr(trainer.checkpoint_callback, "dirpath", None)
+        if dirpath:
+            self._save_final_motifs(pl_module, stats, os.path.join(dirpath, "final_motifs.pt"))
+
+    def _save_final_motifs(self, pl_module, stats, path):
+        """Save the finalized codebook/mosaic in ``extract_motifs.py``'s format
+        (unused centroids dropped so every motif id is referenced)."""
+        counts = stats["motif_counts"]
+        used = counts > 0
+        remap = used.long().cumsum(0) - 1
+        names = {id(p): n for n, p in pl_module.model.named_parameters()}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(
+            {
+                "motifs": stats["_motifs"][used].cpu(),
+                "assignments": remap[stats["_nearest"]].cpu(),
+                "rows": int(self.quant_cfg["rows"]),
+                "cols": int(self.quant_cfg["cols"]),
+                "num_blocks": int(stats["_nearest"].numel()),
+                "num_motifs": int(used.sum()),
+                "layer_specs": [
+                    (names[id(p)], nb, tuple(shape))
+                    for p, nb, _, shape in stats["_layer_specs"]
+                ],
+            },
+            path,
+        )
+
+    def on_validation_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
+        self._finalize_soft_momos(trainer, pl_module, TrainerFn.VALIDATING)
+
+    def on_test_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
+        self._finalize_soft_momos(trainer, pl_module, TrainerFn.TESTING)
+
+    def state_dict(self):
+        if self.method != "soft_momos":
+            return {}
+        return {"M": self.M, "finalized": self.finalized}
+
+    def load_state_dict(self, state_dict):
+        if self.method == "soft_momos":
+            self.M = state_dict.get("M")
+            self.finalized = bool(state_dict.get("finalized", False))
 
     def _log_hierarchical_bit_estimate(self, pl_module: L.LightningModule):
         model = pl_module.model
@@ -170,21 +345,7 @@ class QuantizationCallback(L.Callback):
             f"({est['total_bits'] / baseline:.4%} of dense {baseline} bits)"
         )
 
-        logger = getattr(pl_module, "logger", None)
-        if logger is not None and hasattr(logger, "log_hyperparams"):
-            try:
-                logger.log_hyperparams(
-                    {
-                        "bits/motif": est["motif_bits"],
-                        "bits/iota": est["iota_bits"],
-                        "bits/mosaic": est["mosaic_bits"],
-                        "bits/total": est["total_bits"],
-                        "bits/dense": baseline,
-                        "bits/ratio": est["total_bits"] / baseline,
-                    }
-                )
-            except Exception:
-                pass
+        _log_bits_hyperparams(pl_module, est, baseline)
 
     def _log_fold_bit_estimate(self, pl_module: L.LightningModule):
         model = pl_module.model
@@ -218,20 +379,7 @@ class QuantizationCallback(L.Callback):
             f"({est['total_bits'] / baseline:.4%} of dense {baseline} bits)"
         )
 
-        logger = getattr(pl_module, "logger", None)
-        if logger is not None and hasattr(logger, "log_hyperparams"):
-            try:
-                logger.log_hyperparams(
-                    {
-                        "bits/motif": est["motif_bits"],
-                        "bits/mosaic": est["mosaic_bits"],
-                        "bits/total": est["total_bits"],
-                        "bits/dense": baseline,
-                        "bits/ratio": est["total_bits"] / baseline,
-                    }
-                )
-            except Exception:
-                pass
+        _log_bits_hyperparams(pl_module, est, baseline)
 
     def on_validation_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
         """Apply MoMos projection before validation runs.
@@ -248,6 +396,7 @@ class QuantizationCallback(L.Callback):
             "static_momos2d",
             "hierarchical_momos2d",
             "fold_momos",
+            "soft_momos",
         ]:
             return
 
@@ -255,6 +404,10 @@ class QuantizationCallback(L.Callback):
         # trainer.validate()/test() pass at the end of main: project only during
         # the fit-time validation that follows a real training epoch.
         if trainer.sanity_checking or trainer.state.fn != TrainerFn.FITTING:
+            return
+
+        if self.method == "soft_momos":
+            self._soft_validation_start(pl_module)
             return
 
         model = pl_module.model
@@ -306,14 +459,21 @@ class QuantizationCallback(L.Callback):
                 pl_module.log("quant/" + k, v, on_epoch=True, prog_bar=False)
             self._last_quant_stats = None
 
-        if not self.metric_names:
-            return
+        # Metrics are computed on the weights as validated (the projection for
+        # soft_momos); the raw weights are restored afterwards. Note that
+        # MetricsHistoryCallback runs after this hook and so sees the raw weights.
+        if self.metric_names:
+            self._log_metrics(pl_module)
+        self._restore_raw_params(pl_module)
 
-        model = pl_module.model
+    def on_exception(self, trainer, pl_module, exception):
+        self._restore_raw_params(pl_module)
+
+    def _log_metrics(self, pl_module: L.LightningModule):
         try:
             rows, cols = resolve_block_shape(self.method, self.quant_cfg)
             metrics = compute_metrics(
-                model,
+                pl_module.model,
                 self.metric_names,
                 self.compression_binarized,
                 rows=rows,
@@ -445,10 +605,10 @@ def _build_quantization_callback(cfg, quant_cfg) -> QuantizationCallback:
     full.pop("enabled", None)
 
     method = full.get("method")
-    if method in ("momos2d", "static_momos2d"):
+    if method in ("momos2d", "static_momos2d", "soft_momos"):
         full["s"] = int(full["rows"]) * int(full["cols"])
 
-    if method in ("momos", "momos2d", "static_momos2d"):
+    if method in ("momos", "momos2d", "static_momos2d", "soft_momos"):
         if full.get("k") is None and full.get("capacity") is None:
             raise ValueError(f"{method} requires either k or capacity in config")
 

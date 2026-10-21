@@ -29,6 +29,7 @@ from .momos import (
 from .momos2d import quantize_momos2D, momos2D, tensor2D_to_blocks
 from .momos_hierarchy import quantize_hierarchical_momos2D
 from .fold_momos import quantize_fold_momos
+from .soft_momos import quantize_soft_momos
 from .static_momos import (
     quantize_static_momos2D,
     static_momos2D,
@@ -66,6 +67,8 @@ __all__ = [
     "quantize_hierarchical_momos2D",
     # Fold MoMos (k-means++ refined codebook via fold-stratified sampling)
     "quantize_fold_momos",
+    # Soft MoMos (penalised training + k-means++ finalisation)
+    "quantize_soft_momos",
     # Static MoMos2D (G-function initialised)
     "static_momos2D",
     "quantize_static_momos2D",
@@ -82,6 +85,7 @@ METHODS = {
     "static_momos2d": quantize_static_momos2D,
     "hierarchical_momos2d": quantize_hierarchical_momos2D,
     "fold_momos": quantize_fold_momos,
+    "soft_momos": quantize_soft_momos,
 }
 
 

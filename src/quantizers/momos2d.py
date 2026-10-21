@@ -103,12 +103,18 @@ def _reconstruct_and_apply(layer_specs, all_blocks, quantized_blocks, rows, cols
     return distortion, changed_weights
 
 
-def _get_model_blocks2D(model, rows, cols):
-    """Iterates through params and converts them to blocks."""
+def _get_model_blocks2D(model, rows, cols, detach=True):
+    """Iterates through params and converts them to blocks.
+
+    With ``detach=False`` the blocks stay attached to the autograd graph of the
+    live parameters (used by differentiable penalties such as soft_momos).
+    """
     layer_specs = []
     all_blocks = []
     for param in iter_trainable_params(model):
-        blocks, n_params, shape = tensor2D_to_blocks(param.detach(), rows, cols)
+        blocks, n_params, shape = tensor2D_to_blocks(
+            param.detach() if detach else param, rows, cols
+        )
         layer_specs.append((param, int(blocks.size(0)), int(n_params), shape))
         all_blocks.append(blocks)
 

@@ -67,6 +67,7 @@ optuna:
     - qat
     - hierarchical_momos2d
     - fold_momos
+    - soft_momos
 
   search_space:
     momos2d:
@@ -118,3 +119,25 @@ optuna:
           low: 0.02
           high: 0.5
           log: true
+
+    # final_k is fixed (not searched): it sets the stored codebook size (8 bits
+    # per block at 256). capacity sizes the per-epoch training mosaic.
+    soft_momos:
+      # Searched: block shape (rows x cols) and the penalty weight lam.
+      # Fixed: k = final_k = 256 motifs -> 8 bits per block, so compression is
+      # 8/(rows*cols) bits per weight plus the 256*s*32-bit codebook. Set k to
+      # null and add a capacity {low, high, log} block to search capacity too.
+      # Every entry can be overridden from the command line, e.g.
+      #   optuna.search_space.soft_momos.rows=[1,2,4] \
+      #   optuna.search_space.soft_momos.lam.high=1e5
+      rows: [1, 2, 4]
+      cols: [1, 2, 4, 8]
+      k: 256
+      final_k: 256
+      # The penalty is the MEAN squared deviation per weight, so lam has to be
+      # ~n times larger than a sum-based L2 coefficient; 1e4 ~ weight_decay
+      # 1e-2 on a 1M-parameter model.
+      lam:
+        low: 0.1
+        high: 10000.0
+        log: true

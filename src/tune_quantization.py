@@ -1,7 +1,7 @@
 """Optuna multi-objective hyperparameter optimization for model quantization.
 
 Searches across quantization methods (dense/no quantization, MoMos2D, QAT, v-fold
-/ Hierarchical MoMos2D, Fold MoMos) to construct the Pareto front maximizing
+/ Hierarchical MoMos2D, Fold MoMos, Soft MoMos) to construct the Pareto front maximizing
 Validation Accuracy and Compression Rate.
 
 Includes automated K-fold cross-validation verification for Pareto-optimal trials.
@@ -98,6 +98,45 @@ def _suggest_quant_config(
             "primary": _suggest_block(trial, space.primary, "fm_p"),
             "secondary": _suggest_block(trial, space.secondary, "fm_s"),
         }
+
+    elif method == "soft_momos":
+        # Block shape and the penalty weight are searched; the codebook size is
+        # fixed (k = final_k = 256 -> 8 bits per block), so compression is set
+        # purely by the block size and lam only trades accuracy for distortion.
+        # `k: null` with a `capacity` block falls back to searching capacity.
+        space = search_space.soft_momos
+        lam_spec = space.lam
+        out = {
+            "enabled": True,
+            "method": "soft_momos",
+            "rows": int(trial.suggest_categorical("sm_rows", list(space.rows))),
+            "cols": int(trial.suggest_categorical("sm_cols", list(space.cols))),
+            "force_zero": True,
+            "final_k": int(space.final_k),
+            "lam": float(
+                trial.suggest_float(
+                    "sm_lam",
+                    float(lam_spec.low),
+                    float(lam_spec.high),
+                    log=bool(lam_spec.log),
+                )
+            ),
+        }
+        if space.get("k") is not None:
+            out["k"] = int(space.k)
+            out["capacity"] = None
+        else:
+            cap_spec = space.capacity
+            out["k"] = None
+            out["capacity"] = float(
+                trial.suggest_float(
+                    "sm_capacity",
+                    float(cap_spec.low),
+                    float(cap_spec.high),
+                    log=bool(cap_spec.log),
+                )
+            )
+        return out
 
     else:
         raise ValueError(f"Unsupported quantization method for sampling: {method}")

@@ -84,3 +84,13 @@ quant_search_space:
         low: 0.0001
         high: 0.5
         log: true
+
+  soft_momos:
+    rows: [1, 2, 4]
+    cols: [1, 2, 4, 8]
+    k: 256
+    final_k: 256
+    lam:
+      low: 0.1
+      high: 10000.0
+      log: true

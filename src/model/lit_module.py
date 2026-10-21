@@ -61,6 +61,9 @@ class LitClassifier(L.LightningModule):
 
         self.model = backbone
         self.criterion = nn.CrossEntropyLoss()
+        # Extra differentiable loss terms ``f(self.model) -> scalar tensor`` added
+        # to the CE in ``training_step`` (registered by callbacks, e.g. soft_momos).
+        self.aux_losses: list = []
 
         # Save initial weights before compiling so the snapshot is uncompiled.
         if save_init_path:
@@ -86,6 +89,11 @@ class LitClassifier(L.LightningModule):
 
         self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/acc", acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        if self.aux_losses:
+            aux = sum(f(self.model) for f in self.aux_losses)
+            self.log("train/aux_loss", aux.detach(), on_step=False, on_epoch=True)
+            loss = loss + aux
 
         return loss
 

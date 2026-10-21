@@ -68,14 +68,20 @@ def compute_quantization_bits(
             "bpp": float(q_bits),
         }
 
-    elif method in ("momos2d", "static_momos2d", "momos"):
+    elif method in ("momos2d", "static_momos2d", "momos", "soft_momos"):
         rows = int(quant_cfg.get("rows") or quant_cfg.get("s") or 1)
         cols = int(quant_cfg.get("cols") or 1)
         s = rows * cols
 
         n_blocks = sum((p.numel() + s - 1) // s for p in iter_trainable_params(model))
 
-        if quant_cfg.get("k") is not None:
+        if method == "soft_momos":
+            # The stored codebook is the post-training k-means++ one (final_k);
+            # the training-time k / capacity only shape the penalty mosaic.
+            if quant_cfg.get("final_k") is None:
+                raise ValueError("soft_momos requires 'final_k' in quant_cfg")
+            k = int(quant_cfg["final_k"])
+        elif quant_cfg.get("k") is not None:
             k = int(quant_cfg["k"])
         elif quant_cfg.get("capacity") is not None:
             c = float(quant_cfg["capacity"])
