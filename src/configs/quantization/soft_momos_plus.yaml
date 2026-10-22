@@ -20,6 +20,17 @@ force_zero: true
 lam: 1.0
 lam_warmup_fraction: 0.0
 
+# Growing L1 term: penalty = lam * L2 + mu(epoch) * L1, with L1 the mean absolute
+# deviation of each block from its group mean (constant-magnitude gradient, so it
+# keeps pulling weights onto the mosaic where L2 fades). mu goes from l1_init to
+# l1_final over the epochs before the freeze (or all epochs if freeze_fraction is
+# 0); both 0 = off. l1_schedule: linear | cosine (1 - cos(pi t / 2)) | power
+# (t ** l1_power).
+l1_init: 0.0
+l1_final: 0.0
+l1_schedule: cosine
+l1_power: 2.0
+
 # Validate on Z[M] (raw weights are restored right after) instead of raw weights.
 validate_projected: true
 

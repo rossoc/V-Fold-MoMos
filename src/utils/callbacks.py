@@ -24,6 +24,8 @@ from quantizers.soft_momos import (
     unfreeze_codebook,
     warm_start_mosaic,
     project_fixed_mosaic,
+    l1_ramp,
+    soft_momos_l1_penalty,
     soft_momos_penalty,
 )
 from utils.metrics import compute_metrics, resolve_block_shape
@@ -150,6 +152,7 @@ class QuantizationCallback(L.Callback):
         self.M = None
         self.finalized = False
         self.current_lam = float(quant_cfg.get("lam", 0.0))
+        self.current_l1 = float(quant_cfg.get("l1_init", 0.0) or 0.0)
         self._counts = None
         self._raw_params: list | None = None
         self._aux_fn = None
@@ -218,15 +221,21 @@ class QuantizationCallback(L.Callback):
         rows, cols = int(cfg["rows"]), int(cfg["cols"])
         k, force_zero = int(cfg["k"]), bool(cfg.get("force_zero", True))
 
+        l1_enabled = bool(cfg.get("l1_init", 0.0) or cfg.get("l1_final", 0.0))
         if self._aux_fn is None:
 
             def penalty(m):
                 if self.frozen:  # distortion is identically 0; don't touch the weights
                     return self._zero_penalty
-                return self.current_lam * soft_momos_penalty(
+                value = self.current_lam * soft_momos_penalty(
                     m, self.M, rows, cols, k, force_zero,
                     counts=self._counts, with_stats=False,
                 )[0]
+                if l1_enabled:
+                    value = value + self.current_l1 * soft_momos_l1_penalty(
+                        m, self.M, rows, cols, k, force_zero, counts=self._counts
+                    )
+                return value
 
             self._aux_fn = penalty
         if self._aux_fn not in pl_module.aux_losses:
@@ -256,6 +265,15 @@ class QuantizationCallback(L.Callback):
         ramp = min(1.0, trainer.current_epoch / warmup) if warmup > 0 else 1.0
         self.current_lam = float(cfg["lam"]) * ramp
         freeze_at = self.freeze_epoch(trainer.max_epochs or 1)
+        # L1 weight grows to l1_final by the freeze epoch (or the last epoch).
+        self.current_l1 = l1_ramp(
+            trainer.current_epoch,
+            freeze_at if freeze_at is not None else (trainer.max_epochs or 1),
+            cfg.get("l1_init", 0.0) or 0.0,
+            cfg.get("l1_final", 0.0) or 0.0,
+            cfg.get("l1_schedule", "cosine"),
+            cfg.get("l1_power", 2.0),
+        )
         if freeze_at is not None and trainer.current_epoch >= freeze_at and not self.frozen:
             self._freeze(trainer, pl_module)
 
@@ -351,6 +369,7 @@ class QuantizationCallback(L.Callback):
             )
         stats = {name: float(v) for name, v in stats.items()}
         stats["lam"] = float(self.current_lam)
+        stats["l1"] = float(self.current_l1)
         if cfg.get("validate_projected", True):
             self._raw_params = [
                 p.detach().clone() for p in iter_trainable_params(pl_module.model)

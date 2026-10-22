@@ -21,6 +21,7 @@ Two optional extensions (``soft_momos_plus``) live on the same code path:
   read the weights through :func:`materialized_weights`.
 """
 
+import math
 from contextlib import contextmanager
 
 import torch
@@ -70,6 +71,21 @@ def group_means(blocks, M, k, force_zero=True, counts=None):
     return Z
 
 
+def _deviations(model, M, rows, cols, k, force_zero, counts):
+    """``(blocks, blocks - Z[M], n)`` with ``Z`` the detached group means.
+
+    Differentiable wrt the live parameters (detaching ``Z`` is exact for the L2
+    gradient since deviations from a group mean sum to zero).
+    """
+    blocks, layer_specs = _get_model_blocks2D(model, int(rows), int(cols), detach=False)
+    n = sum(spec[2] for spec in layer_specs)
+    if counts is None:
+        counts = torch.bincount(M, minlength=k)
+    with torch.no_grad():
+        Z = group_means(blocks.detach(), M, k, force_zero, counts)
+    return blocks, blocks - Z[M], n, counts
+
+
 def soft_momos_penalty(
     model, M, rows, cols, k, force_zero=True, counts=None, with_stats=True
 ):
@@ -80,13 +96,8 @@ def soft_momos_penalty(
     ``(penalty, stats)``; stats values are 0-dim tensors (no device sync) and
     ``stats`` is ``{}`` when ``with_stats`` is False.
     """
-    blocks, layer_specs = _get_model_blocks2D(model, int(rows), int(cols), detach=False)
-    n = sum(spec[2] for spec in layer_specs)
-    if counts is None:
-        counts = torch.bincount(M, minlength=k)
-    with torch.no_grad():
-        Z = group_means(blocks.detach(), M, k, force_zero, counts)
-    sq = (blocks - Z[M]).square().sum()
+    blocks, dev, n, counts = _deviations(model, M, rows, cols, k, force_zero, counts)
+    sq = dev.square().sum()
     stats = {}
     if with_stats:
         with torch.no_grad():
@@ -95,6 +106,39 @@ def soft_momos_penalty(
                 "active_motifs": (counts > 0).sum(),
             }
     return sq / n, stats
+
+
+def soft_momos_l1_penalty(model, M, rows, cols, k, force_zero=True, counts=None):
+    """``(1/n) * sum_i ||b_i - Z[M_i]||_1`` with ``Z`` the detached group means.
+
+    Same conventions as :func:`soft_momos_penalty`; the gradient ``sign(w - Z[M]) / n``
+    has constant magnitude, so it keeps pulling weights onto their group mean
+    where the L2 force vanishes.
+    """
+    _, dev, n, _ = _deviations(model, M, rows, cols, k, force_zero, counts)
+    return dev.abs().sum() / n
+
+
+L1_SHAPES = ("linear", "cosine", "power")
+
+
+def l1_ramp(epoch, ramp_epochs, init, final, shape="cosine", power=2.0):
+    """L1 weight at ``epoch``: ``init + (final - init) * g(t)``, ``t = epoch / ramp_epochs``.
+
+    ``g`` is ``t`` (linear), ``1 - cos(pi t / 2)`` (cosine: zero slope at the start,
+    accelerating) or ``t ** power``; ``t`` is clipped to [0, 1] (1 when
+    ``ramp_epochs <= 0``).
+    """
+    if shape not in L1_SHAPES:
+        raise ValueError(f"Unknown l1 schedule {shape!r}; expected one of {L1_SHAPES}")
+    t = 1.0 if ramp_epochs <= 0 else min(1.0, max(0.0, epoch / ramp_epochs))
+    if shape == "linear":
+        g = t
+    elif shape == "cosine":
+        g = 1.0 - math.cos(math.pi * t / 2.0)
+    else:
+        g = t ** float(power)
+    return float(init) + (float(final) - float(init)) * g
 
 
 def project_fixed_mosaic(model, M, rows, cols, k, force_zero=True):

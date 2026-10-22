@@ -166,3 +166,7 @@ optuna:
         log: true
       freeze_fraction: 0.1
       lloyd_iters: 1
+      # Growing L1 term (off unless l1_final is set). Example:
+      #   l1_init: 0.0
+      #   l1_final: {low: 0.1, high: 100.0, log: true}
+      #   l1_schedule: cosine

@@ -138,6 +138,22 @@ def _suggest_soft_momos(trial: optuna.Trial, space: DictConfig, method: str) -> 
             )
         ),
     }
+    # Optional growing-L1 term: l1_final is searched ({low, high, log}) or fixed.
+    if space.get("l1_final") is not None:
+        l1_final = space.l1_final
+        if hasattr(l1_final, "low"):
+            l1_final = trial.suggest_float(
+                f"{pre}_l1_final",
+                float(l1_final.low),
+                float(l1_final.high),
+                log=bool(l1_final.get("log", False)),
+            )
+        out["l1_final"] = float(l1_final)
+        for key in ("l1_init", "l1_power"):
+            if space.get(key) is not None:
+                out[key] = float(space[key])
+        if space.get("l1_schedule") is not None:
+            out["l1_schedule"] = str(space.l1_schedule)
     if method == "soft_momos":
         out["final_k"] = int(space.final_k)
     if method == "soft_momos_plus":
