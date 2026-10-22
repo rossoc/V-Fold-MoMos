@@ -20,6 +20,7 @@ import torch
 from data import ImageDataModule
 from model import build_backbone
 from train import build_datamodule, run_training
+from quantizers.soft_momos import SOFT_MOMOS_METHODS
 from utils.quant_bits import compute_quantization_bits
 
 
@@ -99,47 +100,73 @@ def _suggest_quant_config(
             "secondary": _suggest_block(trial, space.secondary, "fm_s"),
         }
 
-    elif method == "soft_momos":
-        # Block shape and the penalty weight are searched; the codebook size is
-        # fixed (k = final_k = 256 -> 8 bits per block), so compression is set
-        # purely by the block size and lam only trades accuracy for distortion.
-        # `k: null` with a `capacity` block falls back to searching capacity.
-        space = search_space.soft_momos
-        lam_spec = space.lam
-        out = {
-            "enabled": True,
-            "method": "soft_momos",
-            "rows": int(trial.suggest_categorical("sm_rows", list(space.rows))),
-            "cols": int(trial.suggest_categorical("sm_cols", list(space.cols))),
-            "force_zero": True,
-            "final_k": int(space.final_k),
-            "lam": float(
-                trial.suggest_float(
-                    "sm_lam",
-                    float(lam_spec.low),
-                    float(lam_spec.high),
-                    log=bool(lam_spec.log),
-                )
-            ),
-        }
-        if space.get("k") is not None:
-            out["k"] = int(space.k)
-            out["capacity"] = None
-        else:
-            cap_spec = space.capacity
-            out["k"] = None
-            out["capacity"] = float(
-                trial.suggest_float(
-                    "sm_capacity",
-                    float(cap_spec.low),
-                    float(cap_spec.high),
-                    log=bool(cap_spec.log),
-                )
-            )
-        return out
+    elif method in SOFT_MOMOS_METHODS:
+        return _suggest_soft_momos(trial, search_space[method], method)
 
     else:
         raise ValueError(f"Unsupported quantization method for sampling: {method}")
+
+
+# Optuna parameter-name prefix per soft-MoMos method (shared with eval_pareto_cv).
+SOFT_MOMOS_PREFIX = {"soft_momos": "sm", "soft_momos_plus": "smp"}
+
+
+def _suggest_soft_momos(trial: optuna.Trial, space: DictConfig, method: str) -> dict:
+    """Sample a soft_momos / soft_momos_plus config.
+
+    Block shape and the penalty weight are searched; the codebook size is fixed
+    (k = 256 -> 8 bits per block; soft_momos also has final_k = 256, soft_momos_plus has none: its trained codebook is final), so compression is set purely by the
+    block size and lam only trades accuracy for distortion. `k: null` with a
+    `capacity` block falls back to searching capacity. soft_momos_plus also turns
+    warm start on and takes `freeze_fraction` from the space: a {low, high} spec
+    is searched, a plain number is fixed.
+    """
+    pre = SOFT_MOMOS_PREFIX[method]
+    lam_spec = space.lam
+    out = {
+        "enabled": True,
+        "method": method,
+        "rows": int(trial.suggest_categorical(f"{pre}_rows", list(space.rows))),
+        "cols": int(trial.suggest_categorical(f"{pre}_cols", list(space.cols))),
+        "force_zero": True,
+        "lam": float(
+            trial.suggest_float(
+                f"{pre}_lam",
+                float(lam_spec.low),
+                float(lam_spec.high),
+                log=bool(lam_spec.log),
+            )
+        ),
+    }
+    if method == "soft_momos":
+        out["final_k"] = int(space.final_k)
+    if method == "soft_momos_plus":
+        freeze = space.freeze_fraction
+        if hasattr(freeze, "low"):
+            freeze = trial.suggest_float(
+                f"{pre}_freeze_fraction", float(freeze.low), float(freeze.high)
+            )
+        out.update(
+            warm_start=True,
+            reseed_dead=True,
+            lloyd_iters=int(space.get("lloyd_iters", 1)),
+            freeze_fraction=float(freeze),
+        )
+    if space.get("k") is not None:
+        out["k"] = int(space.k)
+        out["capacity"] = None
+    else:
+        cap_spec = space.capacity
+        out["k"] = None
+        out["capacity"] = float(
+            trial.suggest_float(
+                f"{pre}_capacity",
+                float(cap_spec.low),
+                float(cap_spec.high),
+                log=bool(cap_spec.log),
+            )
+        )
+    return out
 
 
 def _build_datamodule(cfg: DictConfig, fold: int) -> ImageDataModule:

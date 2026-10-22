@@ -16,7 +16,13 @@ from omegaconf import OmegaConf
 from quantizers import quantize_qat, k_from_capacity, quantize
 from quantizers.block_utils import iter_trainable_params
 from quantizers.soft_momos import (
+    SOFT_MOMOS_METHODS,
     draw_mosaic,
+    finalize_from_codebook,
+    freeze_codebook,
+    materialized_state,
+    unfreeze_codebook,
+    warm_start_mosaic,
     project_fixed_mosaic,
     soft_momos_penalty,
 )
@@ -114,6 +120,13 @@ class QuantizationCallback(L.Callback):
             epoch. Uses ``utils.metrics.compute_metrics``. Examples: ``sparsity``,
             ``l2``, ``gzip``, ``bz2``, ``lzma``, ``bdm``.
         compression_binarized: Passed to metric computation for compression payloads.
+
+    Limitation (soft_momos_plus): ``fit(ckpt_path=...)`` from a checkpoint written
+    during the frozen phase is rejected in ``on_fit_start``. Its optimizer state has
+    the extra codebook param group and the parametrization is not rebuilt, so the
+    resume would not be coherent. Checkpoints from before ``freeze_epoch`` resume
+    normally (the freeze then happens at ``freeze_epoch``); the plain-keyed
+    checkpoints written while frozen can still be loaded for validate/test/export.
     """
 
     def __init__(
@@ -140,10 +153,30 @@ class QuantizationCallback(L.Callback):
         self._counts = None
         self._raw_params: list | None = None
         self._aux_fn = None
+        # soft_momos_plus: frozen-mosaic phase (``frozen`` stays True after
+        # ``on_fit_end``; ``_handles`` is non-None only while parametrized).
+        self.frozen = False
+        self.Z = None
+        self._handles = None
+        self._zero_penalty = None
+
+    def freeze_epoch(self, max_epochs):
+        """First epoch of the frozen phase (last ``ceil(freeze_fraction*max_epochs)``)."""
+        fraction = float(self.quant_cfg.get("freeze_fraction", 0.0) or 0.0)
+        if fraction <= 0:
+            return None
+        return max(0, int(max_epochs) - math.ceil(fraction * int(max_epochs)))
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
         """Set up QAT parametrizations before training begins."""
-        if self.method == "soft_momos":
+        if self.method in SOFT_MOMOS_METHODS:
+            if self.frozen and self._handles is None:
+                raise RuntimeError(
+                    "Resuming fit from a checkpoint saved during the frozen phase of "
+                    "soft_momos_plus is not supported (the optimizer has an extra "
+                    "param group and the model is not parametrized); resume from an "
+                    "earlier checkpoint or use the saved weights to fine-tune."
+                )
             self._setup_soft_momos(pl_module)
             return
 
@@ -188,6 +221,8 @@ class QuantizationCallback(L.Callback):
         if self._aux_fn is None:
 
             def penalty(m):
+                if self.frozen:  # distortion is identically 0; don't touch the weights
+                    return self._zero_penalty
                 return self.current_lam * soft_momos_penalty(
                     m, self.M, rows, cols, k, force_zero,
                     counts=self._counts, with_stats=False,
@@ -199,10 +234,11 @@ class QuantizationCallback(L.Callback):
 
         q = int(cfg.get("q_bits", 32))
         n = sum(p.numel() for p in iter_trainable_params(model))
-        est = _fold_bit_estimate(n, int(cfg["final_k"]), s, q)
+        stored_k = k if self.freeze_epoch(1) is not None else int(cfg["final_k"])  # freeze => trained codebook is final
+        est = _fold_bit_estimate(n, stored_k, s, q)
         baseline = n * q
         print(
-            f"Soft MoMos bit estimate (q={q}, n={n}, k={k}, final_k={cfg['final_k']}, "
+            f"Soft MoMos bit estimate (q={q}, n={n}, k={k}, stored_k={stored_k}, "
             f"s={s}): motif={est['motif_bits']}, mosaic={est['mosaic_bits']}, "
             f"total={est['total_bits']} "
             f"({est['total_bits'] / baseline:.4%} of dense {baseline} bits)"
@@ -210,22 +246,97 @@ class QuantizationCallback(L.Callback):
         _log_bits_hyperparams(pl_module, est, baseline)
 
     def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
-        """soft_momos: draw a new mosaic from the current weights, update lam."""
-        if self.method != "soft_momos":
+        """soft_momos: new mosaic from the current weights, update lam, maybe freeze."""
+        if self.method not in SOFT_MOMOS_METHODS:
             return
         cfg = self.quant_cfg
-        self.M = draw_mosaic(
-            pl_module.model,
-            cfg["rows"],
-            cfg["cols"],
-            cfg["k"],
-            cfg.get("force_zero", True),
-            cfg.get("chunk_size"),
-        )[0]
-        self._counts = torch.bincount(self.M, minlength=int(cfg["k"]))
+        if not self.frozen:
+            self._new_mosaic(pl_module)
         warmup = float(cfg.get("lam_warmup_fraction", 0.0)) * (trainer.max_epochs or 1)
         ramp = min(1.0, trainer.current_epoch / warmup) if warmup > 0 else 1.0
         self.current_lam = float(cfg["lam"]) * ramp
+        freeze_at = self.freeze_epoch(trainer.max_epochs or 1)
+        if freeze_at is not None and trainer.current_epoch >= freeze_at and not self.frozen:
+            self._freeze(trainer, pl_module)
+
+    def _new_mosaic(self, pl_module):
+        """Random draw, or a Lloyd step from the previous mosaic under ``warm_start``."""
+        cfg = self.quant_cfg
+        rows, cols, k = cfg["rows"], cfg["cols"], int(cfg["k"])
+        force_zero = cfg.get("force_zero", True)
+        if cfg.get("warm_start", False) and self.M is not None:
+            self.M, _, _, stats = warm_start_mosaic(
+                pl_module.model, self.M, rows, cols, k, force_zero,
+                reseed_dead=cfg.get("reseed_dead", True),
+                lloyd_iters=int(cfg.get("lloyd_iters", 1)),
+                chunk_size=cfg.get("chunk_size"),
+            )
+            for name, value in stats.items():
+                pl_module.log(f"quant/{name}", float(value), on_epoch=True)
+        else:
+            self.M = draw_mosaic(
+                pl_module.model, rows, cols, k, force_zero, cfg.get("chunk_size")
+            )[0]
+        self._counts = torch.bincount(self.M, minlength=k)
+
+    def _freeze(self, trainer, pl_module):
+        """Freeze the mosaic: the weights become ``Z[M]`` with ``Z`` the only trainable tensor."""
+        cfg = self.quant_cfg
+        if self.M is None:
+            self._new_mosaic(pl_module)
+        self.Z, self._handles = freeze_codebook(
+            pl_module.model, self.M, cfg["rows"], cfg["cols"], int(cfg["k"]),
+            bool(cfg.get("force_zero", True)),
+        )
+        self._zero_penalty = self.Z.new_zeros(())
+        self.frozen = True
+        self._add_codebook_param_group(trainer)
+        print(
+            f"Soft MoMos+: mosaic frozen at epoch {trainer.current_epoch}; "
+            f"training the codebook only (k={int(cfg['k'])})"
+        )
+
+    def _add_codebook_param_group(self, trainer):
+        """Give ``Z`` its own param group (lr of group 0, no weight decay), keep the
+        LR schedulers in lockstep and free the Adam state of the frozen originals."""
+        optimizers = getattr(trainer, "optimizers", None) or []
+        if not optimizers:
+            return
+        optimizer = optimizers[0]
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    optimizer.state.pop(p, None)  # Adam moments of the originals
+                    p.grad = None
+        group0 = optimizer.param_groups[0]
+        new_group = {"params": [self.Z], "lr": group0["lr"], "weight_decay": 0.0}
+        if "initial_lr" in group0:
+            new_group["initial_lr"] = group0["initial_lr"]
+        optimizer.add_param_group(new_group)
+        for config in getattr(trainer, "lr_scheduler_configs", []):
+            scheduler = config.scheduler
+            if hasattr(scheduler, "base_lrs"):
+                scheduler.base_lrs.append(scheduler.base_lrs[0])
+            if hasattr(scheduler, "_last_lr"):
+                scheduler._last_lr.append(group0["lr"])
+
+    def _unfreeze(self, pl_module):
+        """Make the model plain again (weights stay ``Z[M]``); idempotent."""
+        if self._handles is not None:
+            unfreeze_codebook(pl_module.model, self._handles)
+            self._handles = None
+
+    def on_fit_end(self, trainer, pl_module):
+        self._unfreeze(pl_module)
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        """Write plain-keyed checkpoints (loadable into an unparametrized model)."""
+        if self._handles is None:
+            return
+        state = checkpoint["state_dict"]
+        for key in [key for key in state if "parametrizations" in key]:
+            del state[key]
+        state.update(materialized_state(pl_module))
 
     def _soft_validation_start(self, pl_module: L.LightningModule):
         """Record penalty stats on the raw weights, then optionally project to Z[M]."""
@@ -261,9 +372,19 @@ class QuantizationCallback(L.Callback):
 
     def _finalize_soft_momos(self, trainer, pl_module, fn: TrainerFn):
         """Snap the model to final_k motifs once, when entering validate/test."""
-        if self.method != "soft_momos" or self.finalized or trainer.state.fn != fn:
+        if self.method not in SOFT_MOMOS_METHODS or self.finalized or trainer.state.fn != fn:
             return
-        stats = quantize(pl_module.model, self.quant_cfg)
+        self._unfreeze(pl_module)
+        if self.frozen and self.Z is not None and self.M is not None:
+            # Weights are exactly Z[M] (<= k motifs): adopt the trained codebook.
+            stats = finalize_from_codebook(
+                pl_module.model, self.Z, self.M, self.quant_cfg["rows"],
+                self.quant_cfg["cols"], bool(self.quant_cfg.get("force_zero", True)),
+                chunk_size=self.quant_cfg.get("chunk_size"),
+            )
+            print("Soft MoMos+: codebook finalized without k-means")
+        else:
+            stats = quantize(pl_module.model, self.quant_cfg)
         self.finalized = True
         pl_module.log("quant/final_distortion", stats["distortion"])
         pl_module.log("quant/final_num_motifs_used", float(stats["num_motifs_used"]))
@@ -306,12 +427,19 @@ class QuantizationCallback(L.Callback):
         self._finalize_soft_momos(trainer, pl_module, TrainerFn.TESTING)
 
     def state_dict(self):
-        if self.method != "soft_momos":
+        if self.method not in SOFT_MOMOS_METHODS:
             return {}
-        return {"M": self.M, "finalized": self.finalized}
+        return {
+            "M": self.M,
+            "finalized": self.finalized,
+            "frozen": self.frozen,
+            "Z": None if self.Z is None else self.Z.detach().clone(),
+        }
 
     def load_state_dict(self, state_dict):
-        if self.method == "soft_momos":
+        if self.method in SOFT_MOMOS_METHODS:
+            self.frozen = bool(state_dict.get("frozen", False))
+            self.Z = state_dict.get("Z")
             self.M = state_dict.get("M")
             self.finalized = bool(state_dict.get("finalized", False))
 
@@ -396,7 +524,7 @@ class QuantizationCallback(L.Callback):
             "static_momos2d",
             "hierarchical_momos2d",
             "fold_momos",
-            "soft_momos",
+            *SOFT_MOMOS_METHODS,
         ]:
             return
 
@@ -406,8 +534,15 @@ class QuantizationCallback(L.Callback):
         if trainer.sanity_checking or trainer.state.fn != TrainerFn.FITTING:
             return
 
-        if self.method == "soft_momos":
-            self._soft_validation_start(pl_module)
+        if self.method in SOFT_MOMOS_METHODS:
+            if not self.frozen:
+                self._soft_validation_start(pl_module)
+            elif self._counts is not None:  # weights are already Z[M]: keep dashboards continuous
+                self._last_quant_stats = {
+                    "rel_distortion": 0.0,
+                    "active_motifs": float((self._counts > 0).sum()),
+                    "lam": float(self.current_lam),
+                }
             return
 
         model = pl_module.model
@@ -468,6 +603,7 @@ class QuantizationCallback(L.Callback):
 
     def on_exception(self, trainer, pl_module, exception):
         self._restore_raw_params(pl_module)
+        self._unfreeze(pl_module)
 
     def _log_metrics(self, pl_module: L.LightningModule):
         try:
@@ -605,10 +741,10 @@ def _build_quantization_callback(cfg, quant_cfg) -> QuantizationCallback:
     full.pop("enabled", None)
 
     method = full.get("method")
-    if method in ("momos2d", "static_momos2d", "soft_momos"):
+    if method in ("momos2d", "static_momos2d", *SOFT_MOMOS_METHODS):
         full["s"] = int(full["rows"]) * int(full["cols"])
 
-    if method in ("momos", "momos2d", "static_momos2d", "soft_momos"):
+    if method in ("momos", "momos2d", "static_momos2d", *SOFT_MOMOS_METHODS):
         if full.get("k") is None and full.get("capacity") is None:
             raise ValueError(f"{method} requires either k or capacity in config")
 

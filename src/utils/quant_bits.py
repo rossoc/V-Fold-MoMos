@@ -7,6 +7,13 @@ ratio for dense models, QAT, MoMos2D, and Hierarchical (v-fold) MoMos2D.
 import math
 import torch.nn as nn
 from quantizers.block_utils import iter_trainable_params
+from quantizers.soft_momos import SOFT_MOMOS_METHODS
+
+
+def _soft_keeps_trained_codebook(quant_cfg) -> bool:
+    """Soft MoMos with a frozen phase: the trained codebook (size k) is the final one
+    (no k-means, ``final_k`` unused)."""
+    return float(quant_cfg.get("freeze_fraction", 0.0) or 0.0) > 0
 
 
 def count_trainable_parameters(model: nn.Module) -> int:
@@ -68,14 +75,14 @@ def compute_quantization_bits(
             "bpp": float(q_bits),
         }
 
-    elif method in ("momos2d", "static_momos2d", "momos", "soft_momos"):
+    elif method in ("momos2d", "static_momos2d", "momos", *SOFT_MOMOS_METHODS):
         rows = int(quant_cfg.get("rows") or quant_cfg.get("s") or 1)
         cols = int(quant_cfg.get("cols") or 1)
         s = rows * cols
 
         n_blocks = sum((p.numel() + s - 1) // s for p in iter_trainable_params(model))
 
-        if method == "soft_momos":
+        if method in SOFT_MOMOS_METHODS and not _soft_keeps_trained_codebook(quant_cfg):
             # The stored codebook is the post-training k-means++ one (final_k);
             # the training-time k / capacity only shape the penalty mosaic.
             if quant_cfg.get("final_k") is None:

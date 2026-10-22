@@ -10,9 +10,22 @@ its centroid, giving the stored ``{Z, M}`` description.
 Padding rule: zero padding added by ``tensor2D_to_blocks`` participates in the
 group means and penalty like any block entry; the normaliser ``n`` is the number
 of REAL weights.
+
+Two optional extensions (``soft_momos_plus``) live on the same code path:
+
+* warm start (:func:`warm_start_mosaic`): the per-epoch mosaic is a Lloyd step
+  from the previous epoch's mosaic instead of a fresh random draw;
+* frozen phase (:func:`freeze_codebook`): the mosaic is fixed and the weights are
+  *parametrized* as ``Z[M]``, so the codebook ``Z`` is the only trainable tensor.
+  While parametrized, ``iter_trainable_params`` yields ``Z``, not the weights;
+  read the weights through :func:`materialized_weights`.
 """
 
+from contextlib import contextmanager
+
 import torch
+import torch.nn as nn
+from torch.nn.utils import parametrize
 from sklearn.cluster import KMeans, MiniBatchKMeans
 
 from .block_utils import (
@@ -20,7 +33,10 @@ from .block_utils import (
     _initialize_motifs,
     _nearest_motifs_chunked,
 )
-from .momos2d import _get_model_blocks2D, _reconstruct_and_apply
+from .momos2d import _get_model_blocks2D, _reconstruct_and_apply, blocks_to_tensor2D
+
+# ``soft_momos_plus`` is ``soft_momos`` with ``warm_start``/``freeze_fraction`` on.
+SOFT_MOMOS_METHODS = ("soft_momos", "soft_momos_plus")
 
 
 def draw_mosaic(model, rows, cols, k, force_zero=True, chunk_size=None):
@@ -153,6 +169,36 @@ def finalize_soft_momos(
     }
 
 
+def finalize_from_codebook(model, Z, M, rows, cols, force_zero=True, chunk_size=None):
+    """Finalize a model whose weights are ``Z[M]`` (after a frozen phase) without k-means.
+
+    The codebook and mosaic already describe the weights exactly, so they are
+    adopted as is (row 0 zeroed under ``force_zero``, as in the parametrization).
+    Returns the stats dict of :func:`finalize_soft_momos`; ``distortion`` is
+    measured against the current weights (0 when they are bit-exactly ``Z[M]``).
+    """
+    rows, cols = int(rows), int(cols)
+    with torch.no_grad():
+        blocks, layer_specs = _get_model_blocks2D(model, rows, cols)
+        motifs = Z.detach().to(blocks).clone()
+        if force_zero:
+            motifs[0] = 0.0
+        nearest = M.to(blocks.device)
+        distortion, changed = _reconstruct_and_apply(
+            layer_specs, blocks, motifs[nearest], rows, cols
+        )
+        counts = torch.bincount(nearest, minlength=motifs.size(0))
+    return {
+        "distortion": float(distortion),
+        "num_changed_weights": int(changed),
+        "num_motifs_used": int((counts > 0).sum()),
+        "motif_counts": counts,
+        "_motifs": motifs,
+        "_nearest": nearest,
+        "_layer_specs": layer_specs,
+    }
+
+
 def quantize_soft_momos(model, quant_cfg):
     """Registry entry: the post-training finalisation step of soft_momos."""
     fin = quant_cfg.get("finalize") or {}
@@ -168,3 +214,169 @@ def quantize_soft_momos(model, quant_cfg):
         backend=fin.get("backend", "minibatch"),
         chunk_size=quant_cfg.get("chunk_size"),
     )
+
+
+def warm_start_mosaic(
+    model,
+    M_prev,
+    rows,
+    cols,
+    k,
+    force_zero=True,
+    reseed_dead=True,
+    lloyd_iters=1,
+    chunk_size=None,
+):
+    """``lloyd_iters`` Lloyd steps on the CURRENT blocks, starting from ``M_prev``.
+
+    Each step: group means under the current mosaic, optional reseeding of dead
+    motifs (no member; motif 0 excluded under ``force_zero``) with distinct random
+    blocks, then nearest assignment. Weights are left untouched. Returns
+    ``(M, Z, layer_specs, stats)`` with ``Z`` the codebook ``M`` was assigned
+    against and python-number ``stats`` (``mosaic_changed`` relative to
+    ``M_prev``; ``dead_motifs`` of the first step, before reseeding).
+    """
+    rows, cols, k = int(rows), int(cols), int(k)
+    with torch.no_grad():
+        blocks, layer_specs = _get_model_blocks2D(model, rows, cols)
+        M, dead_first = M_prev, None
+        for _ in range(int(lloyd_iters)):
+            counts = torch.bincount(M, minlength=k)
+            Z = group_means(blocks, M, k, force_zero, counts)
+            dead = counts == 0
+            if force_zero:
+                dead[0] = False
+            n_dead = int(dead.sum())
+            dead_first = n_dead if dead_first is None else dead_first
+            if reseed_dead and n_dead:
+                pick = torch.randperm(blocks.size(0), device=blocks.device)[:n_dead]
+                Z[dead] = blocks[pick]
+            M = _nearest_motifs_chunked(blocks, Z, chunk_size=chunk_size)
+        changed = float((M != M_prev).float().mean())
+    return M, Z, layer_specs, {"mosaic_changed": changed, "dead_motifs": dead_first}
+
+
+class CodebookTensor(nn.Module):
+    """Parametrization ``weight = blocks_to_tensor2D(Z[M_slice])`` (ignores the original).
+
+    ``Z`` is the ``nn.Parameter`` shared by all parametrized tensors; the gather's
+    backward scatter-adds the weight gradients into ``Z`` (O(n)). Under
+    ``force_zero`` row 0 is masked in the (small) codebook, not in the gathered
+    blocks, so ``Z[0]`` gets no gradient and never reaches the weights.
+    """
+
+    is_codebook_tensor = True  # duck-typed: ``quantizers`` and ``src.quantizers`` coexist
+
+    def __init__(self, Z, M_slice, shape, rows, cols, force_zero, out_shape):
+        super().__init__()
+        self.Z = Z
+        self.register_buffer("M", M_slice)
+        keep = torch.ones(Z.size(0), 1, dtype=Z.dtype, device=Z.device)
+        if force_zero:
+            keep[0] = 0.0
+        self.register_buffer("keep", keep)
+        self.shape, self.rows, self.cols = tuple(shape), rows, cols
+        self.out_shape = tuple(out_shape)
+
+    def forward(self, _original):
+        blocks = (self.Z * self.keep)[self.M]
+        return blocks_to_tensor2D(blocks, self.shape, self.rows, self.cols).reshape(
+            self.out_shape
+        )
+
+
+def _param_owners(model):
+    """``{id(param): (module, attribute name)}`` for every direct parameter."""
+    return {
+        id(p): (mod, name)
+        for mod in model.modules()
+        for name, p in mod._parameters.items()
+        if p is not None
+    }
+
+
+def freeze_codebook(model, M, rows, cols, k, force_zero=True):
+    """Make ``Z`` (group means of the current blocks under ``M``) the only trainable
+    tensor: every quantized weight becomes ``Z[M]`` through a :class:`CodebookTensor`.
+
+    Returns ``(Z, handles)``; pass ``handles`` to :func:`unfreeze_codebook`.
+    """
+    rows, cols, k = int(rows), int(cols), int(k)
+    with torch.no_grad():
+        blocks, specs = _get_model_blocks2D(model, rows, cols)
+        Z = nn.Parameter(group_means(blocks, M, k, force_zero))
+    owners = _param_owners(model)
+    handles, offset = [], 0
+    for param, n_blocks, _, shape in specs:
+        mod, name = owners[id(param)]
+        param.requires_grad_(False)
+        parametrize.register_parametrization(
+            mod,
+            name,
+            CodebookTensor(Z, M[offset : offset + n_blocks], shape, rows, cols,
+                           force_zero, param.shape),
+            unsafe=True,
+        )
+        mod.parametrizations[name].original.requires_grad_(False)
+        handles.append((mod, name))
+        offset += n_blocks
+    return Z, handles
+
+
+def unfreeze_codebook(model, handles):
+    """Inverse of :func:`freeze_codebook` (idempotent): plain weights ``== Z[M]``."""
+    for mod, name in handles:
+        if parametrize.is_parametrized(mod, name):
+            parametrize.remove_parametrizations(mod, name, leave_parametrized=True)
+            getattr(mod, name).requires_grad_(True)
+
+
+def _codebook_sites(model):
+    """Yield ``(qualified module name, module, param name, ParametrizationList)``."""
+    for mod_name, mod in model.named_modules():
+        if parametrize.is_parametrized(mod):
+            for name, plist in mod.parametrizations.items():
+                if getattr(plist[0], "is_codebook_tensor", False):
+                    yield mod_name, mod, name, plist
+
+
+def materialized_state(model):
+    """``{plain state_dict key: materialized weight}`` of the parametrized tensors."""
+    with torch.no_grad():
+        return {
+            f"{mod_name}.{name}" if mod_name else name: getattr(mod, name).clone()
+            for mod_name, mod, name, _ in _codebook_sites(model)
+        }
+
+
+@contextmanager
+def materialized_weights(model):
+    """Read-only view of a parametrized model: inside, ``iter_trainable_params``
+    yields one tensor per quantized tensor holding its materialized ``Z[M]``
+    values (the originals, temporarily rebound; ``Z`` is hidden). Everything is
+    restored on exit, also on exceptions; a no-op for plain models. Writes made
+    inside are not persisted.
+    """
+    sites = list(_codebook_sites(model))
+    if not sites:
+        yield model
+        return
+    saved, codebooks = [], {}
+    try:
+        with torch.no_grad():
+            for _, mod, name, plist in sites:
+                orig = plist.original
+                saved.append((orig, orig.data, orig.requires_grad))
+                orig.data = getattr(mod, name)  # one materialisation per tensor
+                orig.requires_grad_(True)
+                Z = plist[0].Z
+                codebooks.setdefault(id(Z), (Z, Z.requires_grad))
+        for Z, _ in codebooks.values():
+            Z.requires_grad_(False)
+        yield model
+    finally:
+        for orig, data, requires_grad in saved:
+            orig.data = data
+            orig.requires_grad_(requires_grad)
+        for Z, requires_grad in codebooks.values():
+            Z.requires_grad_(requires_grad)

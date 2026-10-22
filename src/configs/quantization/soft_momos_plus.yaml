@@ -1,0 +1,36 @@
+enabled: true
+method: soft_momos_plus
+
+rows: 1
+cols: 2
+
+# Motifs in the per-epoch training mosaic: absolute k, or capacity (fraction of
+# blocks) when k is null.
+k: 256
+capacity: null
+
+# final_k is intentionally absent: after the frozen phase the trained codebook Z
+# (k motifs) is the final one, no k-means runs, and bit accounting uses k.
+# (With freeze_fraction: 0 it would be required, as in soft_momos.)
+
+force_zero: true
+
+# Penalty weight on the mean squared deviation of each block from its group
+# mean, linearly ramped over the first lam_warmup_fraction of the epochs.
+lam: 1.0
+lam_warmup_fraction: 0.0
+
+# Validate on Z[M] (raw weights are restored right after) instead of raw weights.
+validate_projected: true
+
+chunk_size: null
+
+# soft_momos_plus extensions (on here).
+# warm_start: the per-epoch mosaic is `lloyd_iters` Lloyd steps from the previous
+# one instead of a fresh random draw; reseed_dead refills empty motifs with random
+# blocks. freeze_fraction: for the last ceil(fraction * epochs) epochs the mosaic is
+# frozen and only the codebook Z is trained.
+warm_start: true
+reseed_dead: true
+lloyd_iters: 1
+freeze_fraction: 0.1

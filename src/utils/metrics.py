@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import warnings
 from src.quantizers import iter_trainable_params, tensor2D_to_blocks
+from src.quantizers.soft_momos import materialized_weights
 
 with warnings.catch_warnings():
     warnings.filterwarnings(
@@ -177,6 +178,11 @@ def compute_metrics(model, names, compression_binarized=False, rows=1, cols=1):
     Returns:
         Dict of merged metric outputs.
     """
+    with materialized_weights(model):  # frozen soft_momos_plus: read Z[M], not Z
+        return _compute_metrics(model, names, compression_binarized, rows, cols)
+
+
+def _compute_metrics(model, names, compression_binarized, rows, cols):
     analyzer = WeightAnalyzer(
         model,
         compression_binarized=compression_binarized,

@@ -68,6 +68,7 @@ optuna:
     - hierarchical_momos2d
     - fold_momos
     - soft_momos
+    - soft_momos_plus
 
   search_space:
     momos2d:
@@ -141,3 +142,17 @@ optuna:
         low: 0.1
         high: 10000.0
         log: true
+
+    # soft_momos + warm-started mosaic and a frozen-mosaic codebook fine-tuning
+    # phase over the last ceil(freeze_fraction * epochs) epochs. freeze_fraction is
+    # fixed here; give it {low, high} to search it.
+    soft_momos_plus:
+      rows: [1, 2, 4]
+      cols: [1, 2, 4, 8]
+      k: 256   # no final_k: after the frozen phase the codebook is final
+      lam:
+        low: 0.1
+        high: 10000.0
+        log: true
+      freeze_fraction: 0.1
+      lloyd_iters: 1

@@ -86,6 +86,7 @@ METHODS = {
     "hierarchical_momos2d": quantize_hierarchical_momos2D,
     "fold_momos": quantize_fold_momos,
     "soft_momos": quantize_soft_momos,
+    "soft_momos_plus": quantize_soft_momos,
 }
 
 

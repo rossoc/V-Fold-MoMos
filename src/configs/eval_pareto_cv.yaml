@@ -94,3 +94,14 @@ quant_search_space:
       low: 0.1
       high: 10000.0
       log: true
+
+  soft_momos_plus:
+    rows: [1, 2, 4]
+    cols: [1, 2, 4, 8]
+    k: 256
+    lam:
+      low: 0.1
+      high: 10000.0
+      log: true
+    freeze_fraction: 0.1
+    lloyd_iters: 1

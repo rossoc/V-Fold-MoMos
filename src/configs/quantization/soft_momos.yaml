@@ -31,3 +31,13 @@ finalize:
   seed: ${seed}
 
 chunk_size: null
+
+# soft_momos_plus extensions (off here; see soft_momos_plus.yaml).
+# warm_start: the per-epoch mosaic is `lloyd_iters` Lloyd steps from the previous
+# one instead of a fresh random draw; reseed_dead refills empty motifs with random
+# blocks. freeze_fraction: for the last ceil(fraction * epochs) epochs the mosaic is
+# frozen and only the codebook Z is trained.
+warm_start: false
+reseed_dead: true
+lloyd_iters: 1
+freeze_fraction: 0.0
