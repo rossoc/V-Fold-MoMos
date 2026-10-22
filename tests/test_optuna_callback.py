@@ -201,3 +201,48 @@ def test_single_objective_callback_still_reports_and_can_prune():
     trial._should_prune = True
     with pytest.raises(optuna.TrialPruned):
         cb.on_train_epoch_end(FakeTrainer({"val/acc": 0.42}, epoch=3), pl_module=None)
+
+
+def _stratified_study():
+    # Five high-compression trials (16x) with low accuracy and five
+    # low-compression ones (8x) with high accuracy, all recorded at epoch 5.
+    return FakeStudy(
+        [FakeFrozenTrial(i, {"epoch_5_val_acc": 0.30 + 0.01 * i, "compression_rate": 16.0}) for i in range(5)]
+        + [FakeFrozenTrial(10 + i, {"epoch_5_val_acc": 0.60 + 0.01 * i, "compression_rate": 8.0}) for i in range(5)]
+    )
+
+
+def test_stratified_pruning_compares_only_within_same_compression_rate():
+    trial = FakeTrial(number=99, study=_stratified_study())
+    trial.set_user_attr("compression_rate", 16.0 * 1.01)  # within the 5% tolerance
+    cb = _callback(
+        trial, n_startup_trials=5, n_warmup_steps=0, min_history=3,
+        percentile=50.0, stratify_by="compression_rate",
+    )
+    # 0.40 is below the study-wide median (~0.45) but above the 16x median (0.32):
+    # it must survive when stratified ...
+    cb.on_train_epoch_end(FakeTrainer({"val/acc": 0.40}, epoch=5), pl_module=None)
+    # ... and be pruned without stratification.
+    cb_global = _callback(trial, n_startup_trials=5, n_warmup_steps=0, min_history=3, percentile=50.0)
+    with pytest.raises(optuna.TrialPruned):
+        cb_global.on_train_epoch_end(FakeTrainer({"val/acc": 0.40}, epoch=5), pl_module=None)
+
+
+def test_stratified_pruning_still_prunes_within_stratum_and_skips_unmatched():
+    trial = FakeTrial(number=99, study=_stratified_study())
+    trial.set_user_attr("compression_rate", 16.0)
+    cb = _callback(
+        trial, n_startup_trials=5, n_warmup_steps=0, min_history=3,
+        percentile=50.0, stratify_by="compression_rate",
+    )
+    with pytest.raises(optuna.TrialPruned):
+        cb.on_train_epoch_end(FakeTrainer({"val/acc": 0.25}, epoch=5), pl_module=None)
+
+    # A trial at a compression rate nobody else has: no history -> never pruned.
+    lonely = FakeTrial(number=98, study=_stratified_study())
+    lonely.set_user_attr("compression_rate", 32.0)
+    cb_lonely = _callback(
+        lonely, n_startup_trials=5, n_warmup_steps=0, min_history=3,
+        percentile=50.0, stratify_by="compression_rate",
+    )
+    cb_lonely.on_train_epoch_end(FakeTrainer({"val/acc": 0.01}, epoch=5), pl_module=None)

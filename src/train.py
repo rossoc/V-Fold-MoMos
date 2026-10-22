@@ -146,6 +146,8 @@ def run_training(
                         n_warmup_steps=int(pruner_cfg.get("n_warmup_steps", 3)),
                         percentile=float(pruner_cfg.get("percentile", 50.0)),
                         min_history=int(pruner_cfg.get("min_history", 3)),
+                        stratify_by=pruner_cfg.get("stratify_by", None),
+                        stratify_rtol=float(pruner_cfg.get("stratify_rtol", 0.05)),
                     )
                 )
             # else: pruning explicitly disabled via config — attach nothing.

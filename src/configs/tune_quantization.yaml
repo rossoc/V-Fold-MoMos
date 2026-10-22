@@ -54,6 +54,12 @@ optuna:
     n_warmup_steps: 10
     percentile: 50.0
     min_history: 5
+    # Compare a trial only against trials with (nearly) the same
+    # compression_rate user_attr: accuracy differs systematically along the
+    # compression axis, and a study-wide median prunes the high-compression
+    # side of the front. null = study-wide comparison.
+    stratify_by: compression_rate
+    stratify_rtol: 0.05
 
   # Pareto feasibility floor: trials with mean val_acc below this are marked
   # infeasible and excluded from the front (drops ~random-guess points).
@@ -131,28 +137,33 @@ optuna:
       # Every entry can be overridden from the command line, e.g.
       #   optuna.search_space.soft_momos.rows=[1,2,4] \
       #   optuna.search_space.soft_momos.lam.high=1e5
+      # Ranges narrowed after study mlp_soft_momos (102 trials): block size 1
+      # (8 bpp) is dominated by block size 2 at equal accuracy, so 1x1 is out;
+      # lam below ~100 never helped, and at block sizes >= 8 the best trials
+      # sat at the top of the old range (1e4), so the range moves to 1e2..1e5.
       rows: [1, 2, 4]
-      cols: [1, 2, 4, 8]
+      cols: [2, 4, 8]
       k: 256
       final_k: 256
       # The penalty is the MEAN squared deviation per weight, so lam has to be
       # ~n times larger than a sum-based L2 coefficient; 1e4 ~ weight_decay
       # 1e-2 on a 1M-parameter model.
       lam:
-        low: 0.1
-        high: 10000.0
+        low: 100.0
+        high: 100000.0
         log: true
 
-    # soft_momos + warm-started mosaic and a frozen-mosaic codebook fine-tuning
-    # phase over the last ceil(freeze_fraction * epochs) epochs. freeze_fraction is
-    # fixed here; give it {low, high} to search it.
     soft_momos_plus:
+      # Same searched space as soft_momos (so the two fronts are comparable);
+      # no final_k: after the frozen phase the trained codebook (k motifs) is
+      # kept as is. freeze_fraction/lloyd_iters are fixed (scalars); give
+      # freeze_fraction a {low, high} block to search it.
       rows: [1, 2, 4]
-      cols: [1, 2, 4, 8]
-      k: 256   # no final_k: after the frozen phase the codebook is final
+      cols: [2, 4, 8]
+      k: 256
       lam:
-        low: 0.1
-        high: 10000.0
+        low: 100.0
+        high: 100000.0
         log: true
       freeze_fraction: 0.1
       lloyd_iters: 1

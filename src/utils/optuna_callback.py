@@ -94,11 +94,16 @@ class OptunaMultiObjectiveEpochPruning(L.Callback):
        ``optuna.TrialPruned`` directly (bypassing ``should_prune()``, which
        is unavailable here).
 
-    Known limitation: comparing trajectories across differently-configured
-    trials (e.g. different quantization methods) at the same epoch isn't
-    perfectly apples-to-apples, but is a reasonable first-cut heuristic —
-    trials are already tagged with ``user_attrs["method"]`` if a future
-    refinement wants to stratify the comparison per-method.
+    Stratification: in a multi-objective accuracy-vs-compression study a
+    high-compression trial is *expected* to have lower accuracy than a
+    low-compression one, so comparing every trial against the study-wide
+    median prunes the whole high-compression side of the front (observed:
+    88 of 102 soft_momos trials pruned, almost all with block size >= 4).
+    With ``stratify_by`` set to a user_attr name (e.g. ``"compression_rate"``,
+    which ``tune_quantization.py`` records before training starts), the
+    history is restricted to trials whose attribute matches the current
+    trial's within ``stratify_rtol`` (relative), i.e. trials at the same
+    point on the compression axis.
 
     Parameters
     ----------
@@ -124,6 +129,13 @@ class OptunaMultiObjectiveEpochPruning(L.Callback):
     key_prefix:
         Prefix used for the per-epoch user_attr key, so multiple monitors
         or callback instances don't collide.
+    stratify_by:
+        Optional user_attr name; when set, only historical trials whose
+        value of this attribute is within ``stratify_rtol`` (relative) of
+        the current trial's are used for the comparison. ``None`` keeps the
+        study-wide comparison.
+    stratify_rtol:
+        Relative tolerance for ``stratify_by`` matching.
     """
 
     def __init__(
@@ -135,6 +147,8 @@ class OptunaMultiObjectiveEpochPruning(L.Callback):
         percentile: float = 50.0,
         min_history: int = 3,
         key_prefix: str = "epoch",
+        stratify_by: str | None = None,
+        stratify_rtol: float = 0.05,
     ):
         super().__init__()
         self.trial = trial
@@ -144,6 +158,22 @@ class OptunaMultiObjectiveEpochPruning(L.Callback):
         self.percentile = float(percentile)
         self.min_history = int(min_history)
         self.key_prefix = key_prefix
+        self.stratify_by = stratify_by or None
+        self.stratify_rtol = float(stratify_rtol)
+
+    def _same_stratum(self, other: optuna.trial.FrozenTrial) -> bool:
+        """True if ``other`` belongs to the current trial's comparison stratum."""
+        if self.stratify_by is None:
+            return True
+        mine = self.trial.user_attrs.get(self.stratify_by)
+        theirs = other.user_attrs.get(self.stratify_by)
+        if mine is None or theirs is None:
+            return False
+        try:
+            mine_f, theirs_f = float(mine), float(theirs)
+        except (TypeError, ValueError):
+            return mine == theirs
+        return abs(mine_f - theirs_f) <= self.stratify_rtol * max(abs(mine_f), 1e-12)
 
     def _epoch_key(self, epoch: int) -> str:
         return f"{self.key_prefix}_{epoch}_{self.monitor.replace('/', '_')}"
@@ -171,7 +201,7 @@ class OptunaMultiObjectiveEpochPruning(L.Callback):
                 deepcopy=False,
                 states=(optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED),
             )
-            if t.number != self.trial.number
+            if t.number != self.trial.number and self._same_stratum(t)
         ]
 
         # Study-wide startup gate: need enough trials overall to trust the
@@ -192,5 +222,6 @@ class OptunaMultiObjectiveEpochPruning(L.Callback):
             raise optuna.TrialPruned(
                 f"Trial pruned at epoch {epoch} ({self.monitor}={value:.4f} < "
                 f"p{self.percentile:g}={threshold:.4f} over "
-                f"{len(historical_values)} historical trials)"
+                f"{len(historical_values)} historical trials"
+                + (f" with matching {self.stratify_by})" if self.stratify_by else ")")
             )
