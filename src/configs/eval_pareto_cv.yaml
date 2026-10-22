@@ -92,7 +92,7 @@ quant_search_space:
     final_k: 256
     lam:
       low: 0.1
-      high: 10000.0
+      high: 100000.0
       log: true
 
   soft_momos_plus:
@@ -101,7 +101,7 @@ quant_search_space:
     k: 256
     lam:
       low: 0.1
-      high: 10000.0
+      high: 100000.0
       log: true
     freeze_fraction: 0.1
     lloyd_iters: 1
