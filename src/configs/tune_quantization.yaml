@@ -137,19 +137,21 @@ optuna:
       # Every entry can be overridden from the command line, e.g.
       #   optuna.search_space.soft_momos.rows=[1,2,4] \
       #   optuna.search_space.soft_momos.lam.high=1e5
-      # Study mlp_soft_momos (100-epoch trials only): at block size 2, lam 0.3,
-      # 5 and 2142 all reach ~0.55, so the low end of lam is kept; the upper
-      # bound is widened to 1e5 because it was never explored at large blocks.
-      rows: [1, 2, 4]
-      cols: [1, 2, 4, 8]
+      # Blocks of 2-10 weights (compression ~8-36x at k=256). Completed
+      # 100-epoch trials (mlp_soft_momos, mlp_soft_vs_plus): accuracy is flat
+      # in lam over ~1-200 for blocks up to 4 weights, and very large lam
+      # (>=1e4) collapses small blocks (2x2 soft+ at 7e4: 0.257), so lam is
+      # capped at 3e3 here. Larger blocks (size 32) did prefer lam ~1e4+.
+      rows: [1, 2]
+      cols: [2, 3, 4, 5]
       k: 256
       final_k: 256
       # The penalty is the MEAN squared deviation per weight, so lam has to be
       # ~n times larger than a sum-based L2 coefficient; 1e4 ~ weight_decay
       # 1e-2 on a 1M-parameter model.
       lam:
-        low: 0.1
-        high: 100000.0
+        low: 0.3
+        high: 3000.0
         log: true
 
     soft_momos_plus:
@@ -157,12 +159,14 @@ optuna:
       # no final_k: after the frozen phase the trained codebook (k motifs) is
       # kept as is. freeze_fraction/lloyd_iters are fixed (scalars); give
       # freeze_fraction a {low, high} block to search it.
-      rows: [1, 2, 4]
-      cols: [1, 2, 4, 8]
+      rows: [1, 2]
+      cols: [2, 3, 4, 5]
       k: 256
       lam:
-        low: 0.1
-        high: 100000.0
+        low: 0.3
+        high: 3000.0
         log: true
-      freeze_fraction: 0.1
+      freeze_fraction:
+        low: 0.05
+        high: 0.3
       lloyd_iters: 1
