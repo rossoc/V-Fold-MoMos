@@ -112,6 +112,15 @@ class Report:
     def new_figure(
         self, title=None, figSize=(10, 7), ncols=1, nrows=1, fontsize=13
     ) -> Figure:
+        # Redundant safety net: close any figures we already hold before
+        # creating a new one, so matplotlib's global figure registry doesn't
+        # accumulate live figures (each keeps its weight tensors) across a
+        # long report build. Harmless if they were already closed by
+        # save()/close() - closing an already-closed figure is a no-op. Any
+        # not-yet-saved figures are intentionally discarded here (callers
+        # that want them must append+save first).
+        for fig in self.figures:
+            fig.close()
         fig = Figure(title, figSize, ncols, nrows, fontsize)
         self.figures.append(fig)
         return fig
@@ -180,7 +189,7 @@ class Report:
                 if show:
                     fig.show()
 
-    def training_overview(self, run_data, metrics, show=False):
+    def training_overview(self, run_data, metrics, show=False, alpha=0.12):
         fig = self.new_figure("Training Overview", nrows=2, ncols=2)
         tr_overview = {
             "val/acc": "Validation Accuracy",
@@ -199,10 +208,20 @@ class Report:
                 else:
                     data[k] = (range(len(v[m][0])), v[m][0], v[m][1])
             if data:
-                fig.plot_with_var(data, "", y_label=t)
+                fig.plot_with_var(data, "", y_label=t, alpha=alpha)
 
         if show:
             fig.show()
 
     def append_figures(self, figures: list):
         self.figures += figures
+
+    def close(self):
+        """Close every figure this report holds and clear the list, freeing
+        the underlying matplotlib memory. Call after `save()` (or once a
+        config's report is no longer needed) so figures from one weight-
+        analysis config don't accumulate in matplotlib's global registry
+        while the next config's analysis runs."""
+        for fig in self.figures:
+            fig.close()
+        self.figures.clear()

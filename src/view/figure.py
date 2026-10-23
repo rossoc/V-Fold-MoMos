@@ -131,6 +131,7 @@ class Figure:
         limits=None,
         axis=(0, 0),
         grid=True,
+        linewidth: float | None = None,
     ):
         self._next_plot()
 
@@ -144,6 +145,7 @@ class Figure:
                 markersize=markersize,
                 label=name,
                 color=colors[i % len(colors)],
+                linewidth=linewidth,
             )
 
         self._default_settings(
@@ -505,10 +507,26 @@ class Figure:
         else:
             self.fig.savefig(f"{figure_name}.pdf", bbox_inches="tight")
 
+        # Release the underlying matplotlib figure immediately after saving,
+        # so it doesn't accumulate in matplotlib's global figure registry
+        # (which keeps every plt.subplots figure alive until explicitly
+        # closed) and exhaust RAM across many weight-analysis configs.
+        self.close()
+
     def show(self):
         self._enforce_fontsize()
         self.fig.tight_layout()
         self.fig.show()
+
+    def close(self):
+        """Release the underlying matplotlib figure and free its memory.
+
+        Needed because matplotlib keeps every `plt.subplots` figure alive in
+        its global figure registry until explicitly closed - dropping the
+        Python `Figure` wrapper alone does NOT free it. Call this after the
+        figure is saved/rendered to avoid unbounded accumulation across many
+        weight-analysis configs (which can otherwise exhaust RAM)."""
+        plt.close(self.fig)
 
     def axhline(self, data, color, linestyle):
         for label, y in data.items():

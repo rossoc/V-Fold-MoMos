@@ -92,7 +92,7 @@ def report_weight_distribution(
 ) -> list[Figure]:
     res = []
     if scatter:
-        fig = Figure(fontsize=17)
+        fig = Figure(fontsize=13)
         fig.plot(
             scatter,
             f"Motifs per layer - {run[2]}",
@@ -105,7 +105,7 @@ def report_weight_distribution(
         res.append(fig)
 
     if frequencies:
-        fig = Figure(fontsize=17)
+        fig = Figure(fontsize=13)
         fig.plot(
             frequencies,
             "",  # title removed; should be f"Motifs frequencies - {run[2]}"
@@ -114,11 +114,12 @@ def report_weight_distribution(
             colors=["red", "green", "pink", "coral", "purple"],
             axis=None,
             style=style,
+            linewidth=2.5,
         )
         res.append(fig)
 
     if norms:
-        fig = Figure(fontsize=17)
+        fig = Figure(fontsize=13)
         fig.plot(
             norms,
             f"Motifs' norms per layer - {run[2]}",
@@ -136,6 +137,7 @@ def report_weight_distribution(
             f"Motifs' norms per layer - {run[2]}",
             nrows=2,
             ncols=2,
+            fontsize=13,
         )
         for (n, d), c in zip(scatter_layer.items(), ["red", "green", "pink", "coral"]):
             _ = fig.plot(
@@ -247,7 +249,7 @@ def _plot_motifs_by_total_frequency(
     _, to_color, _ = _size_scale(counts, scale="linear")
     sizes = to_size(counts)
 
-    fig = Figure(fontsize=17)
+    fig = Figure(fontsize=13)
     ax = fig._ax()
     ax.scatter(
         motifs[:, 0].numpy(),
@@ -272,46 +274,76 @@ def _plot_motifs_by_total_frequency(
     return fig
 
 
-def _plot_motifs_by_layer_spread(
-    blocks: list[torch.Tensor],
+def _plot_motifs_by_unit_spread(
+    blocks_per_unit: list[torch.Tensor],
     epoch: str,
+    unit_label: str,
+    legend_title: str,
     style: Literal["sci", "scientific", "plain"] = "sci",
 ) -> Figure:
-    """Scatter of unique motifs; dot size = number of distinct layers containing that motif
-    on a count**2 scale (each layer contributing at most 1, regardless of how many times it
-    repeats within it), while dot color follows the actual (linear) count instead (blue=few,
-    grey=mid, red=many)."""
-    per_layer_unique = [b.unique(dim=0) for b in blocks]
-    motifs, layer_counts = torch.cat(per_layer_unique, dim=0).unique(
+    """Scatter of unique motifs; dot size = number of distinct entries of `blocks_per_unit`
+    containing that motif on a count**2 scale (each entry contributing at most 1, regardless
+    of how many times it repeats within it), while dot color follows the actual (linear)
+    count instead (blue=few, grey=mid, red=many).
+
+    Generic over what a "unit" is - `_plot_motifs_by_layer_spread` calls this once per layer
+    (`blocks_per_unit` = one run's per-layer blocks) and `plot_motifs_by_fold_spread` calls it
+    once per CV fold (`blocks_per_unit` = one all-layers `all_blocks` tensor per fold)."""
+    per_unit_unique = [b.unique(dim=0) for b in blocks_per_unit]
+    motifs, unit_counts = torch.cat(per_unit_unique, dim=0).unique(
         dim=0, return_counts=True
     )
-    to_size, _, legend_counts = _size_scale(layer_counts, scale="power", power=2.0)
-    _, to_color, _ = _size_scale(layer_counts, scale="linear")
-    sizes = to_size(layer_counts)
+    to_size, _, legend_counts = _size_scale(unit_counts, scale="power", power=2.0)
+    _, to_color, _ = _size_scale(unit_counts, scale="linear")
+    sizes = to_size(unit_counts)
 
-    fig = Figure(fontsize=17)
+    fig = Figure(fontsize=13)
     ax = fig._ax()
     ax.scatter(
         motifs[:, 0].numpy(),
         motifs[:, 1].numpy(),
         s=sizes.numpy(),
-        c=to_color(layer_counts).numpy(),
+        c=to_color(unit_counts).numpy(),
         cmap=_FREQ_CMAP,
         vmin=0.0,
         vmax=1.0,
         alpha=0.6,
     )
-    _size_legend(ax, to_size, to_color, legend_counts, _FREQ_CMAP, "# Layers")
+    _size_legend(ax, to_size, to_color, legend_counts, _FREQ_CMAP, legend_title)
     fig._default_settings(
         "$w_1$",
         "$w_2$",
-        f"Motifs by number of layers - {epoch}",
+        f"Motifs by number of {unit_label} - {epoch}",
         style,
         False,
         False,
         axis=None,
     )
     return fig
+
+
+def _plot_motifs_by_layer_spread(
+    blocks: list[torch.Tensor],
+    epoch: str,
+    style: Literal["sci", "scientific", "plain"] = "sci",
+) -> Figure:
+    return _plot_motifs_by_unit_spread(blocks, epoch, "layers", "# Layers", style=style)
+
+
+def plot_motifs_by_fold_spread(
+    blocks_per_fold: list[torch.Tensor],
+    epoch: str,
+    style: Literal["sci", "scientific", "plain"] = "sci",
+) -> Figure:
+    """Scatter of unique motifs across a config's CV folds; dot size = number of distinct
+    folds whose weights (all layers concatenated - see `extract_blocks_2d`) contain that
+    motif at least once, on a count**2 scale, dot color follows the linear count (blue=few,
+    grey=mid, red=many). `blocks_per_fold` is one `all_blocks` tensor per fold. Mirrors
+    `_plot_motifs_by_layer_spread` at fold granularity instead of layer granularity - see
+    `notebook/v-fold_wa.py`."""
+    return _plot_motifs_by_unit_spread(
+        blocks_per_fold, epoch, "folds", "# Folds", style=style
+    )
 
 
 def _plot_all_blocks(

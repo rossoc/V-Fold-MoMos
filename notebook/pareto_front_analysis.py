@@ -14,11 +14,13 @@ import pandas as pd
 from optuna.trial import TrialState
 
 from src.view import Report
-from src.view.pareto import plot_pareto_front
+from src.view.pareto import DEFAULT_METHOD_LABELS, plot_pareto_front
 
-DB_PATH = "outputs/resnet_paretofront4.db"
+nn = "resnet"
+title = ("Resnet20 Pareto Front",)
+DB_PATH = f"outputs/{nn}_paretofront4.db"
 STUDY_NAME = None
-OUTPUT_PDF = "resnet_pareto_front.pdf"
+OUTPUT_PDF = f"{nn}_pareto_front.pdf"
 
 
 def load_non_pruned_trials(db_path: str, study_name: str | None = None) -> pd.DataFrame:
@@ -69,13 +71,13 @@ df = load_non_pruned_trials(DB_PATH, STUDY_NAME)
 # stays a faithful raw dump of the study. Trials reused via tune_quantization.py's
 # exact-param cache never re-run `trial.set_user_attr("method", ...)`, so their
 # `method` falls back to "unknown" - drop them, since which method they actually
-# used can't be recovered from this db. Relabel the dense/no-quantization
-# baseline ("none") to a clearer name for the plot legend.
+# used can't be recovered from this db. Relabel the raw method names to
+# shorter, presentation-friendly names for the plot legend.
 n_unknown = int((df["method"] == "unknown").sum())
 if n_unknown:
     print(f"Dropping {n_unknown} trial(s) with method == 'unknown' (missing user_attr)")
 df = df[df["method"] != "unknown"].copy()
-df["method"] = df["method"].replace({"none": "Baseline"})
+df["method"] = df["method"].replace(DEFAULT_METHOD_LABELS)
 
 n_opt = int(df["is_pareto_optimal"].sum())
 print(f"Loaded {len(df)} non-pruned (COMPLETE) trials from {DB_PATH}")
@@ -89,8 +91,8 @@ fig = plot_pareto_front(
     group="method",
     optimal="is_pareto_optimal",
     x_label=r"$r_\mathrm{\phi}$",
-    y_label="Accuracy",
-    title="Quantization Pareto Front",
+    y_label="Validation Accuracy",
+    title=title,
 )
 
 report = Report()

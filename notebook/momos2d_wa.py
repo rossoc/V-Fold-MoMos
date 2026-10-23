@@ -6,15 +6,16 @@ from src.view.weight_distribution import plot_weights_2d
 import os
 from tqdm import trange
 
-project = "momos2d-remake"  # "momos-reproduction"
+project = "momos2d-collapse"  # "momos-reproduction"
 api = wandb.Api()
 runs = [
-    "model-pw0ti3vz",
-    # "model-qcci4krm",
-    # "model-y4jvu3xv"
+    ("model-pw0ti3vz", "momos"),
+    ("model-qcci4krm", "momos"),
+    # "model-y4jvu3xv",
+    ("model-2fieryvz", "vfold"),
 ]
 _config_cache = {}
-for run_name in runs:
+for run_name, method in runs:
     report = Report()
     rows = cols = cap = None
     for i in trange(0, 20):
@@ -35,11 +36,23 @@ for run_name in runs:
                 artifact.download(root=root)
 
         q_cfg = _config_cache[run_name]
-        rows, cols, cap = q_cfg["rows"], q_cfg["cols"], q_cfg["capacity"]
+
+        if q_cfg["method"] == "momos2d":
+            rows, cols, cap = (
+                q_cfg["rows"],
+                q_cfg["cols"],
+                q_cfg["capacity"],
+            )
+        elif q_cfg["method"] == "hierarchical_momos2d":
+            rows, cols, cap = (
+                q_cfg["primary"]["rows"],
+                q_cfg["primary"]["cols"],
+                q_cfg["primary"]["capacity"],
+            )
         if os.path.exists(ckpt_path):
             report.append_figures(plot_weights_2d(ckpt_path, rows, cols, i * 20))
         for figure in report.figures:
-            figure.fontsize = 13
+            figure.fontsize = 20
 
     if rows is not None:
-        report.save(f"momos2d_wa_r{rows}_c{cols}_cap{cap}.pdf")
+        report.save(f"{method}_wa_r{rows}_c{cols}_cap{cap}.pdf")

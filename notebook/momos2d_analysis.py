@@ -3,7 +3,13 @@
 # %%
 import pandas as pd
 import wandb
-from src.view import Report, extract_columns, merge_dfs
+from src.view import (
+    Report,
+    compute_pareto_mask,
+    extract_columns,
+    merge_dfs,
+    plot_compression_breakdown,
+)
 import ast
 import numpy as np
 from tqdm import tqdm
@@ -13,12 +19,32 @@ project = "momos2d-remake"  # "momos-reproduction"
 api = wandb.Api()
 
 
-def momos_complexity(n, cap, s, q=32):
+def momos2d_k(n, cap, s):
+    """Realized motif/codebook count for a momos2d config - the `k` shown in
+    the compression-breakdown bar label, matching
+    `src.view.training_analysis.format_group_label`'s convention (the actual
+    integer motif count, not the raw `capacity` fraction)."""
     m = np.ceil(n / s)
-    k = np.maximum(1, np.floor(m * cap))
+    return int(np.maximum(1, np.floor(m * cap)))
+
+
+def momos_complexity_breakdown(n, cap, s, q=32):
+    """Same formula as `momos_complexity`, split into its two components -
+    for the compression-breakdown bar chart (`plot_compression_breakdown`),
+    which needs each component's bit count separately rather than summed."""
+    m = np.ceil(n / s)
+    k = momos2d_k(n, cap, s)
     motif_complexity = k * s * q
     mosaic_complexity = m * np.ceil(np.log2(k))
-    return motif_complexity + mosaic_complexity
+    # "Motifs" (plural) is the key plot_compression_breakdown expects -
+    # COMPONENT_COLORS in src/view/pareto.py keys off it, and a singular
+    # "Motif" raises ValueError before the figure is ever drawn.
+    return {"Motifs": motif_complexity, "Mosaic": mosaic_complexity}
+
+
+def momos_complexity(n, cap, s, q=32):
+    parts = momos_complexity_breakdown(n, cap, s, q=q)
+    return parts["Motifs"] + parts["Mosaic"]
 
 
 # %%
@@ -172,10 +198,61 @@ fig_ras.plot_with_var(
     "",
     symbol="o-",
     x_label="Compression Ratio",
-    y_label="Validation Accuracy",
+    y_label="Test Accuracy",
 )
 # fig_ras.show()
 
+# %%
+# Compression breakdown, picking only the Pareto-optimal momos2d configs -
+# unlike the pareto-cv report (notebook/resnet_pareto_cv_analysis.py), there
+# are many more runs here (repeated per (rows, cols, capacity) combo, several
+# combos dominated), so aggregate to one point per config first and filter
+# to the Pareto front before decomposing each surviving config's compressed
+# size into motif/mosaic bits. Uses this notebook's own local
+# momos_complexity_breakdown formula (n is a fixed constant here, not a live
+# model) rather than compute_quantization_bits/build_compression_breakdown,
+# which need an actual backbone - plot_compression_breakdown itself is the
+# same generic function either way, no knowledge of where the bits come from.
+config_stats = (
+    momos2d_df.groupby(["rows", "cols", "capacity"])
+    .agg(ras=("ras", "first"), test_acc_mean=("test_acc", "mean"))
+    .reset_index()
+)
+config_stats["is_pareto_optimal"] = compute_pareto_mask(
+    config_stats, x="ras", y="test_acc_mean"
+)
+pareto_momos2d = config_stats[config_stats["is_pareto_optimal"]]
+print(f"{len(pareto_momos2d)} / {len(config_stats)} momos2d configs are Pareto-optimal")
+
+breakdown_rows = []
+for r in pareto_momos2d.itertuples():
+    parts = momos_complexity_breakdown(n, r.capacity, r.rows * r.cols)
+    dense_bits = n * 32
+    k = momos2d_k(n, r.capacity, r.rows * r.cols)
+    bar_label = f"MoMos\n({r.rows}, {r.cols})\n$k={k}$"
+    for component, bits in parts.items():
+        breakdown_rows.append(
+            {
+                "bar_label": bar_label,
+                "component": component,
+                "bits_fraction": bits / dense_bits,
+            }
+        )
+
+breakdown_df = pd.DataFrame(breakdown_rows)
+if breakdown_df.empty:
+    print(
+        "No Pareto-optimal momos2d configs found - skipping compression breakdown plot."
+    )
+else:
+    tallest = breakdown_df.groupby('bar_label')['bits_fraction'].sum().max()
+    print(f'Tallest breakdown bar: {tallest:.4f} of dense (y-axis capped at 0.4)')
+    # Fixed to [0, 0.4], matching notebook/mlp_pareto_cv_analysis.py and
+    # notebook/resnet_pareto_cv_analysis.py, so the breakdowns across all
+    # three reports are measured against the same ruler. Anything taller
+    # than 0.4 would be clipped silently - the print above is the guard.
+    fig_breakdown = plot_compression_breakdown(breakdown_df, ylim=(0.0, 0.4))
+    report.append_figures([fig_breakdown])
 
 # %%
 # report.save("momos2d_brief.pdf")
