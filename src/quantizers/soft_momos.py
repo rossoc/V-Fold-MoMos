@@ -158,6 +158,49 @@ def project_fixed_mosaic(model, M, rows, cols, k, force_zero=True):
     }
 
 
+def blend_toward_mosaic(model, M, rows, cols, k, alpha, force_zero=True):
+    """Blend each weight toward its mosaic projection: ``w <- (1-alpha) w + alpha Z[M]``.
+
+    ``alpha`` in [0, 1]; ``alpha=1`` is the hard projection
+    (:func:`project_fixed_mosaic`), ``alpha=0`` leaves the weights untouched.
+    ``Z`` is the detached group means of the current blocks under ``M``. Used to
+    make the frozen-mosaic transition smooth: ramping ``alpha`` 0 -> 1 over the
+    epochs before ``freeze_epoch`` pulls the weights onto the mosaic gradually,
+    so the hard freeze at ``alpha=1`` changes nothing and there is no
+    val-acc bump / train-acc drop.
+
+    Returns the same stats dict as :func:`project_fixed_mosaic` (distortion and
+    changed-weight counts are measured against the pre-blend weights).
+    """
+    rows, cols, k = int(rows), int(cols), int(k)
+    with torch.no_grad():
+        blocks, layer_specs = _get_model_blocks2D(model, rows, cols)
+        counts = torch.bincount(M, minlength=k)
+        Z = group_means(blocks, M, k, force_zero, counts)
+        projected = Z[M]
+        distortion = 0.0
+        changed = 0
+        offset = 0
+        for param, n_blocks, n_params, shape in layer_specs:
+            next_offset = offset + n_blocks
+            orig = blocks_to_tensor2D(
+                blocks[offset:next_offset], shape, rows, cols
+            ).reshape(param.shape)
+            proj = blocks_to_tensor2D(
+                projected[offset:next_offset], shape, rows, cols
+            ).reshape(param.shape)
+            blended = (1.0 - alpha) * orig + alpha * proj
+            distortion += (orig - proj).square().sum().item()
+            changed += (orig != proj).sum().item()
+            param.data.copy_(blended)
+            offset = next_offset
+    return {
+        "distortion": float(distortion),
+        "num_changed_weights": int(changed),
+        "num_motifs_used": int((counts > 0).sum()),
+    }
+
+
 def finalize_soft_momos(
     model,
     rows,

@@ -18,6 +18,7 @@ dependencies = [
     "numpy",
     "optuna>=4.0.0",
     "pandas>=3.0.2",
+    "plotly>=7.1.0",
     "pybdm>=0.1.0",
     "pysr>=1.5.10",
     "scikit-learn>=1.8.0",
@@ -40,5 +41,6 @@ allow-direct-references = true
 
 [dependency-groups]
 dev = [
+    "jupyter>=1.1.1",
     "pytest>=9.0.3",
 ]

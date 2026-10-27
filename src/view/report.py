@@ -184,6 +184,7 @@ class Report:
                     # second column (i=1,3): drop the metric name from the legend
                     show_y1_legend=(i % 2 == 0),
                     show_y2_legend=(i % 2 == 1),
+                    legend_loc="best",
                 )
                 i += 1
                 if show:

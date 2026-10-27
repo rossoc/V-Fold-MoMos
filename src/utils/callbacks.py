@@ -17,6 +17,7 @@ from quantizers import quantize_qat, k_from_capacity, quantize
 from quantizers.block_utils import iter_trainable_params
 from quantizers.soft_momos import (
     SOFT_MOMOS_METHODS,
+    blend_toward_mosaic,
     draw_mosaic,
     finalize_from_codebook,
     freeze_codebook,
@@ -24,12 +25,12 @@ from quantizers.soft_momos import (
     unfreeze_codebook,
     warm_start_mosaic,
     project_fixed_mosaic,
-    l1_ramp,
-    soft_momos_l1_penalty,
     soft_momos_penalty,
 )
 from utils.metrics import compute_metrics, resolve_block_shape
 
+
+PERIODIC_CHECKPOINT_EVERY = 20
 
 # Keys returned by ``quantize`` that are not scalar metrics to log under quant/.
 _QUANT_LOG_SKIP = {
@@ -152,7 +153,10 @@ class QuantizationCallback(L.Callback):
         self.M = None
         self.finalized = False
         self.current_lam = float(quant_cfg.get("lam", 0.0))
-        self.current_l1 = float(quant_cfg.get("l1_init", 0.0) or 0.0)
+        # Fraction of total epochs over which to blend the weights toward the
+        # mosaic before the freeze (0 = off, preserving the hard-freeze jump).
+        self.blend_fraction = float(quant_cfg.get("blend_fraction", 0.0) or 0.0)
+        self.blend_alpha = 0.0
         self._counts = None
         self._raw_params: list | None = None
         self._aux_fn = None
@@ -221,21 +225,15 @@ class QuantizationCallback(L.Callback):
         rows, cols = int(cfg["rows"]), int(cfg["cols"])
         k, force_zero = int(cfg["k"]), bool(cfg.get("force_zero", True))
 
-        l1_enabled = bool(cfg.get("l1_init", 0.0) or cfg.get("l1_final", 0.0))
         if self._aux_fn is None:
 
             def penalty(m):
                 if self.frozen:  # distortion is identically 0; don't touch the weights
                     return self._zero_penalty
-                value = self.current_lam * soft_momos_penalty(
+                return self.current_lam * soft_momos_penalty(
                     m, self.M, rows, cols, k, force_zero,
                     counts=self._counts, with_stats=False,
                 )[0]
-                if l1_enabled:
-                    value = value + self.current_l1 * soft_momos_l1_penalty(
-                        m, self.M, rows, cols, k, force_zero, counts=self._counts
-                    )
-                return value
 
             self._aux_fn = penalty
         if self._aux_fn not in pl_module.aux_losses:
@@ -265,17 +263,33 @@ class QuantizationCallback(L.Callback):
         ramp = min(1.0, trainer.current_epoch / warmup) if warmup > 0 else 1.0
         self.current_lam = float(cfg["lam"]) * ramp
         freeze_at = self.freeze_epoch(trainer.max_epochs or 1)
-        # L1 weight grows to l1_final by the freeze epoch (or the last epoch).
-        self.current_l1 = l1_ramp(
-            trainer.current_epoch,
-            freeze_at if freeze_at is not None else (trainer.max_epochs or 1),
-            cfg.get("l1_init", 0.0) or 0.0,
-            cfg.get("l1_final", 0.0) or 0.0,
-            cfg.get("l1_schedule", "cosine"),
-            cfg.get("l1_power", 2.0),
-        )
+        # Blend the weights toward the mosaic over the epochs before the freeze,
+        # so the hard freeze at alpha=1 is smooth (no val-acc bump / train-acc drop).
+        if not self.frozen and self.blend_fraction > 0 and freeze_at is not None:
+            self._blend_toward_freeze(trainer, pl_module, freeze_at)
         if freeze_at is not None and trainer.current_epoch >= freeze_at and not self.frozen:
             self._freeze(trainer, pl_module)
+
+    def _blend_toward_freeze(self, trainer, pl_module, freeze_at):
+        """Blend weights toward ``Z[M]`` with ``alpha`` ramping 0 -> 1 over the
+        ``blend_fraction`` of epochs ending at ``freeze_at``. At ``alpha=1`` the
+        weights are already on the mosaic, so the hard freeze changes nothing."""
+        cfg = self.quant_cfg
+        max_epochs = trainer.max_epochs or 1
+        blend_epochs = max(1, int(self.blend_fraction * max_epochs))
+        blend_start = max(0, freeze_at - blend_epochs)
+        epoch = trainer.current_epoch
+        if epoch < blend_start:
+            return
+        alpha = min(1.0, (epoch - blend_start) / max(1, freeze_at - blend_start))
+        self.blend_alpha = alpha
+        stats = blend_toward_mosaic(
+            pl_module.model, self.M, int(cfg["rows"]), int(cfg["cols"]),
+            int(cfg["k"]), alpha, bool(cfg.get("force_zero", True)),
+        )
+        for name, value in stats.items():
+            pl_module.log(f"quant/{name}", float(value), on_epoch=True)
+        pl_module.log("quant/blend_alpha", float(alpha), on_epoch=True)
 
     def _new_mosaic(self, pl_module):
         """Random draw, or a Lloyd step from the previous mosaic under ``warm_start``."""
@@ -369,7 +383,6 @@ class QuantizationCallback(L.Callback):
             )
         stats = {name: float(v) for name, v in stats.items()}
         stats["lam"] = float(self.current_lam)
-        stats["l1"] = float(self.current_l1)
         if cfg.get("validate_projected", True):
             self._raw_params = [
                 p.detach().clone() for p in iter_trainable_params(pl_module.model)
@@ -613,12 +626,77 @@ class QuantizationCallback(L.Callback):
                 pl_module.log("quant/" + k, v, on_epoch=True, prog_bar=False)
             self._last_quant_stats = None
 
+        # Persist the epoch's mosaic/codebook together with the weights as
+        # validated (the projection Z[M]) while the model is still projected.
+        # The raw weights in the periodic checkpoint do not coincide with the
+        # motifs (the mosaic is redrawn every epoch and the weights are only
+        # projected onto it during validation), so the projected weights are
+        # saved next to the motifs.
+        if (
+            self.method in SOFT_MOMOS_METHODS
+            and self.M is not None
+            and not trainer.sanity_checking
+            and trainer.state.fn == TrainerFn.FITTING
+        ):
+            self._save_epoch_motifs(trainer, pl_module)
+
         # Metrics are computed on the weights as validated (the projection for
         # soft_momos); the raw weights are restored afterwards. Note that
         # MetricsHistoryCallback runs after this hook and so sees the raw weights.
         if self.metric_names:
             self._log_metrics(pl_module)
         self._restore_raw_params(pl_module)
+
+    def _save_epoch_motifs(self, trainer: L.Trainer, pl_module: L.LightningModule):
+        """Save the current mosaic/codebook state to ``epoch_motifs-epoch={N}.pt``.
+
+        Saved on the same cadence as the periodic weight checkpoint (every
+        ``PERIODIC_CHECKPOINT_EVERY`` epochs, only when ``periodic_checkpoint``
+        is enabled). Holds the *live* per-epoch state: the mosaic ``M`` drawn at
+        the start of this epoch, the detached group means ``Z``, the weights as
+        validated (``weights``: the projection onto ``M`` when
+        ``validate_projected``, else the raw weights) and, when projected, the
+        ``raw_weights`` they were projected from. Tensors are moved to CPU.
+        """
+        if not trainer.checkpoint_callback or not getattr(
+            trainer.checkpoint_callback, "dirpath", None
+        ):
+            return
+        if not any(
+            isinstance(cb, ModelCheckpoint) and cb.filename == "epoch-{epoch:02d}"
+            for cb in trainer.checkpoint_callbacks
+        ):
+            return
+        if (int(trainer.current_epoch) + 1) % PERIODIC_CHECKPOINT_EVERY != 0:
+            return
+        cfg = self.quant_cfg
+        epoch = int(trainer.current_epoch)
+        path = os.path.join(
+            trainer.checkpoint_callback.dirpath, f"epoch_motifs-epoch={epoch}.pt"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(
+            {
+                "epoch": epoch,
+                "rows": int(cfg["rows"]),
+                "cols": int(cfg["cols"]),
+                "k": int(cfg["k"]),
+                "weights": [
+                    p.detach().cpu().clone()
+                    for p in iter_trainable_params(pl_module.model)
+                ],
+                "raw_weights": None
+                if self._raw_params is None
+                else [p.cpu() for p in self._raw_params],
+                "M": self.M.detach().cpu(),
+                "Z": None if self.Z is None else self.Z.detach().cpu(),
+                "counts": None if self._counts is None else self._counts.detach().cpu(),
+                "lam": float(self.current_lam),
+                "frozen": bool(self.frozen),
+                "finalized": bool(self.finalized),
+            },
+            path,
+        )
 
     def on_exception(self, trainer, pl_module, exception):
         self._restore_raw_params(pl_module)
@@ -735,7 +813,7 @@ def _periodic_checkpoint(checkpoint_dir: str) -> ModelCheckpoint:
     return ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="epoch-{epoch:02d}",
-        every_n_epochs=20,
+        every_n_epochs=PERIODIC_CHECKPOINT_EVERY,
         save_top_k=-1,
     )
 

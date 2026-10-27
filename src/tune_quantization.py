@@ -138,22 +138,16 @@ def _suggest_soft_momos(trial: optuna.Trial, space: DictConfig, method: str) -> 
             )
         ),
     }
-    # Optional growing-L1 term: l1_final is searched ({low, high, log}) or fixed.
-    if space.get("l1_final") is not None:
-        l1_final = space.l1_final
-        if hasattr(l1_final, "low"):
-            l1_final = trial.suggest_float(
-                f"{pre}_l1_final",
-                float(l1_final.low),
-                float(l1_final.high),
-                log=bool(l1_final.get("log", False)),
+    # Blend the weights toward the mosaic over the last blend_fraction of epochs
+    # before the freeze (alpha 0 -> 1), so the hard freeze is smooth. A {low, high}
+    # spec is searched, a plain number is fixed.
+    if space.get("blend_fraction") is not None:
+        bf = space.blend_fraction
+        if hasattr(bf, "low"):
+            bf = trial.suggest_float(
+                f"{pre}_blend_fraction", float(bf.low), float(bf.high)
             )
-        out["l1_final"] = float(l1_final)
-        for key in ("l1_init", "l1_power"):
-            if space.get(key) is not None:
-                out[key] = float(space[key])
-        if space.get("l1_schedule") is not None:
-            out["l1_schedule"] = str(space.l1_schedule)
+        out["blend_fraction"] = float(bf)
     if method == "soft_momos":
         out["final_k"] = int(space.final_k)
     if method == "soft_momos_plus":
@@ -363,7 +357,7 @@ def main(cfg: DictConfig):
     # Multi-objective study: Maximize Accuracy and Maximize Compression Rate.
     # Native Optuna pruning (trial.report/should_prune, optuna.pruners.*) is
     # unsupported for multi-objective studies, so pruning is instead handled
-    # manually by OptunaMultiObjectiveEpochPruning     
+    # manually by OptunaMultiObjectiveEpochPruning
     study = optuna.create_study(
         study_name=study_name,
         storage=storage_url,

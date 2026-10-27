@@ -426,6 +426,49 @@ def plot_weights_2d(
     return _plot_all_blocks(run_display, all_blocks, blocks, layers_specs, style=style)
 
 
+def plot_weights_2d_from_tensors(
+    weights,
+    rows,
+    cols,
+    epoch,
+    ckpt_path="",
+    M=None,
+    style: Literal["sci", "scientific", "plain"] = "sci",
+) -> list[Figure]:
+    """`plot_weights_2d` for weights already in memory (a list of tensors, one per
+    quantized parameter, in `iter_trainable_params` order) instead of a checkpoint.
+
+    `M` (optional): the mosaic, one motif index per block over all layers. Blocks
+    touching padding (e.g. a (1, n) bias with rows=2) lose the padded entry when the
+    weights are rebuilt, so they no longer equal their motif; with `M` every block is
+    snapped back to the most frequent block value of its motif."""
+    rows, cols = int(rows), int(cols)
+    blocks, layers_specs = [], []
+    for w in weights:
+        b, n_params, shape = tensor2D_to_blocks(w.detach(), rows, cols)
+        blocks.append(b)
+        layers_specs.append((w, int(b.size(0)), int(n_params), shape))
+    all_blocks = torch.cat(blocks, dim=0)
+    if M is not None:
+        M = M.long()
+        pairs, inverse, counts = torch.unique(
+            torch.cat([M[:, None].float(), all_blocks], dim=1),
+            dim=0,
+            return_inverse=True,
+            return_counts=True,
+        )
+        motif_value = torch.zeros(int(M.max()) + 1, all_blocks.size(1))
+        best = torch.full((motif_value.size(0),), -1)
+        for pair, c in zip(pairs, counts):
+            j = int(pair[0])
+            if c > best[j]:
+                best[j], motif_value[j] = c, pair[1:]
+        all_blocks = motif_value[M]
+        blocks = list(torch.split(all_blocks, [b.size(0) for b in blocks]))
+    run_display = (ckpt_path, f"rows={rows},cols={cols}", f"epoch={epoch}")
+    return _plot_all_blocks(run_display, all_blocks, blocks, layers_specs, style=style)
+
+
 def plot_blocks(
     run, blocks, layers_specs, style: Literal["sci", "scientific", "plain"] = "sci"
 ):

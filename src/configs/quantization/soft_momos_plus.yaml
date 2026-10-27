@@ -18,30 +18,19 @@ force_zero: true
 # Penalty weight on the mean squared deviation of each block from its group
 # mean, linearly ramped over the first lam_warmup_fraction of the epochs.
 lam: 1.0
-lam_warmup_fraction: 0.0
+lam_warmup_fraction: 0.1
 
-# Growing L1 term: penalty = lam * L2 + mu(epoch) * L1, with L1 the mean absolute
-# deviation of each block from its group mean (constant-magnitude gradient, so it
-# keeps pulling weights onto the mosaic where L2 fades). mu goes from l1_init to
-# l1_final over the epochs before the freeze (or all epochs if freeze_fraction is
-# 0); both 0 = off. l1_schedule: linear | cosine (1 - cos(pi t / 2)) | power
-# (t ** l1_power).
-l1_init: 0.0
-l1_final: 0.0
-l1_schedule: cosine
-l1_power: 2.0
+# Blend the weights toward the mosaic over the last blend_fraction of epochs
+# before the freeze (alpha 0 -> 1), so the hard freeze at alpha=1 is smooth
+# (no val-acc bump / train-acc drop). 0 = off (hard freeze jump).
+blend_fraction: 0.1
 
 # Validate on Z[M] (raw weights are restored right after) instead of raw weights.
 validate_projected: true
 
 chunk_size: null
 
-# soft_momos_plus extensions (on here).
-# warm_start: the per-epoch mosaic is `lloyd_iters` Lloyd steps from the previous
-# one instead of a fresh random draw; reseed_dead refills empty motifs with random
-# blocks. freeze_fraction: for the last ceil(fraction * epochs) epochs the mosaic is
-# frozen and only the codebook Z is trained.
 warm_start: true
 reseed_dead: true
 lloyd_iters: 1
-freeze_fraction: 0.1
+freeze_fraction: 0.25

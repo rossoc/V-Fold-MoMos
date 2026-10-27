@@ -360,6 +360,7 @@ class Figure:
         grid=True,
         show_y1_legend=True,
         show_y2_legend=True,
+        legend_loc: str = "upper right",
     ):
         self._next_plot()
 
@@ -445,7 +446,7 @@ class Figure:
         legend_labels = (labels1 if show_y1_legend else []) + (
             labels2 if show_y2_legend else []
         )
-        ax1.legend(legend_lines, legend_labels, loc="upper right")
+        ax1.legend(legend_lines, legend_labels, loc=legend_loc)
         ax2.legend([], [], title=exp_name, loc="lower left")
 
     def _style_text(self, text, fontsize=None):
