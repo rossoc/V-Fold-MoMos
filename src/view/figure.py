@@ -6,6 +6,7 @@ import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 
 _FONT = font_manager.FontProperties(fname="note/fonts/HKGrotesk-Regular.ttf")
+_LINEWIDTH = 2.0  # one line width for every curve, so all report pages look alike
 
 _COLORS = [
     "red",
@@ -131,7 +132,7 @@ class Figure:
         limits=None,
         axis=(0, 0),
         grid=True,
-        linewidth: float | None = None,
+        linewidth: float = _LINEWIDTH,
     ):
         self._next_plot()
 
@@ -176,6 +177,7 @@ class Figure:
         markersize=5,
         legend=True,
         grid=True,
+        linewidth: float = _LINEWIDTH,
     ):
         """
         data is of the kind:
@@ -193,6 +195,7 @@ class Figure:
                 markersize=markersize,
                 label=name,
                 color=_COLORS[i % len(_COLORS)],
+                linewidth=linewidth,
             )
             ax.fill_between(
                 points[0],
@@ -284,6 +287,7 @@ class Figure:
         grid=True,
         show_y1_label=True,
         show_y2_label=True,
+        linewidth=_LINEWIDTH,
     ):
         self._next_plot()
 
@@ -299,6 +303,7 @@ class Figure:
             points[1][skip_n : len(points[0]) - pop_n],
             symbol,
             markersize=markersize,
+            linewidth=linewidth,
             label=y1_label,
             color=colors[0],
         )
@@ -322,6 +327,7 @@ class Figure:
             points[1][skip_n : len(points[0]) - pop_n],
             symbol,
             markersize=markersize,
+            linewidth=linewidth,
             label=y2_label,
             color=colors[1],
         )
@@ -352,7 +358,7 @@ class Figure:
         symbol="-",
         style: Literal["sci", "scientific", "plain"] = "plain",
         markersize=5,
-        linewidth=2.5,
+        linewidth=_LINEWIDTH,
         skip_n=0,
         pop_n=0,
         colors=_COLORS,
