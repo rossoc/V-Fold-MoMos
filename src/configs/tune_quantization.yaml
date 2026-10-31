@@ -75,6 +75,7 @@ optuna:
     - fold_momos
     - soft_momos
     - soft_momos_plus
+    - simple_momos
 
   search_space:
     momos2d:
@@ -175,3 +176,12 @@ optuna:
       blend_fraction: 
         low: 0.01
         high: 0.8
+
+    simple_momos:
+      # Same block shapes and k as soft_momos (so the fronts are comparable).
+      # No lam: there is no penalty, only a per-epoch Lloyd step + projection.
+      # Set k to null and add a capacity {low, high, log} block to search it.
+      rows: [1, 2]
+      cols: [2, 3, 4, 5]
+      k: 256
+      reseed_dead: true

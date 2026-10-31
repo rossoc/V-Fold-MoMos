@@ -1,0 +1,23 @@
+enabled: true
+method: simple_momos
+
+# Simple MoMos: a persistent codebook Z, refined by a Lloyd step every epoch
+# (M <- nearest(w, Z); Z <- group means under M), then the weights are
+# hard-projected to Z[M]. No per-batch penalty (cheaper than soft_momos); motifs
+# persist across epochs (unlike momos2d, which redraws them at random).
+
+rows: 1
+cols: 2
+
+# Codebook size: absolute k, or capacity (fraction of blocks) when k is null.
+# The trained Z is the stored codebook (no k-means finalisation).
+k: 256
+capacity: null
+
+force_zero: true
+
+# Refill motifs that lost all their blocks with random blocks (otherwise they
+# keep their previous value).
+reseed_dead: true
+
+chunk_size: null

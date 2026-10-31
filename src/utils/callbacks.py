@@ -27,6 +27,12 @@ from quantizers.soft_momos import (
     project_fixed_mosaic,
     soft_momos_penalty,
 )
+from quantizers.simple_momos import (
+    SIMPLE_MOMOS_METHODS,
+    codebook_from_weights,
+    init_codebook,
+    simple_momos_step,
+)
 from utils.metrics import compute_metrics, resolve_block_shape
 
 
@@ -187,6 +193,10 @@ class QuantizationCallback(L.Callback):
             self._setup_soft_momos(pl_module)
             return
 
+        if self.method in SIMPLE_MOMOS_METHODS:
+            self._setup_simple_momos(pl_module)
+            return
+
         if self.method == "hierarchical_momos2d":
             self._log_hierarchical_bit_estimate(pl_module)
             return
@@ -251,6 +261,65 @@ class QuantizationCallback(L.Callback):
             f"({est['total_bits'] / baseline:.4%} of dense {baseline} bits)"
         )
         _log_bits_hyperparams(pl_module, est, baseline)
+
+    def _setup_simple_momos(self, pl_module: L.LightningModule):
+        """Resolve k, draw the initial codebook (unless resumed) and log the bit estimate.
+
+        No aux loss is registered: simple_momos trains on the plain CE and only
+        touches the weights once per epoch (Lloyd step + projection).
+        """
+        model = pl_module.model
+        cfg = self.quant_cfg
+        rows, cols = int(cfg["rows"]), int(cfg["cols"])
+        s = int(cfg.get("s") or rows * cols)
+        if cfg.get("k") is None:
+            cfg["k"] = k_from_capacity(model, s, cfg["capacity"])
+        k, force_zero = int(cfg["k"]), bool(cfg.get("force_zero", True))
+        if self.Z is None:  # fresh run (a resumed run restores Z via load_state_dict)
+            self.Z = init_codebook(model, rows, cols, k, force_zero)
+
+        q = int(cfg.get("q_bits", 32))
+        n = sum(p.numel() for p in iter_trainable_params(model))
+        est = _fold_bit_estimate(n, int(self.Z.size(0)), s, q)
+        baseline = n * q
+        print(
+            f"Simple MoMos bit estimate (q={q}, n={n}, k={int(self.Z.size(0))}, s={s}): "
+            f"motif={est['motif_bits']}, mosaic={est['mosaic_bits']}, "
+            f"total={est['total_bits']} "
+            f"({est['total_bits'] / baseline:.4%} of dense {baseline} bits)"
+        )
+        _log_bits_hyperparams(pl_module, est, baseline)
+
+    def _simple_momos_epoch(self, pl_module: L.LightningModule):
+        """Recompute the mosaic from the persistent motifs, update them, project."""
+        cfg = self.quant_cfg
+        if self.Z is None:
+            self._setup_simple_momos(pl_module)
+        self.Z, self.M, stats = simple_momos_step(
+            pl_module.model,
+            self.Z,
+            cfg["rows"],
+            cfg["cols"],
+            force_zero=bool(cfg.get("force_zero", True)),
+            reseed_dead=bool(cfg.get("reseed_dead", True)),
+            chunk_size=cfg.get("chunk_size"),
+            M_prev=self.M,
+        )
+        self._last_quant_stats = stats
+
+    def _finalize_simple_momos(self, trainer, pl_module, fn: TrainerFn):
+        """On entering validate/test: read the codebook off the (loaded) weights and save it."""
+        if self.method not in SIMPLE_MOMOS_METHODS or self.finalized or trainer.state.fn != fn:
+            return
+        stats = codebook_from_weights(
+            pl_module.model, self.quant_cfg["rows"], self.quant_cfg["cols"]
+        )
+        self.finalized = True
+        pl_module.log("quant/final_num_motifs_used", float(stats["num_motifs_used"]))
+        print(f"Simple MoMos finalized: motifs used={stats['num_motifs_used']}")
+        dirpath = getattr(trainer.checkpoint_callback, "dirpath", None)
+        if dirpath:
+            self._save_final_motifs(pl_module, stats, os.path.join(dirpath, "final_motifs.pt"))
 
     def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
         """soft_momos: new mosaic from the current weights, update lam, maybe freeze."""
@@ -454,11 +523,19 @@ class QuantizationCallback(L.Callback):
 
     def on_validation_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
         self._finalize_soft_momos(trainer, pl_module, TrainerFn.VALIDATING)
+        self._finalize_simple_momos(trainer, pl_module, TrainerFn.VALIDATING)
 
     def on_test_start(self, trainer: L.Trainer, pl_module: L.LightningModule):
         self._finalize_soft_momos(trainer, pl_module, TrainerFn.TESTING)
+        self._finalize_simple_momos(trainer, pl_module, TrainerFn.TESTING)
 
     def state_dict(self):
+        if self.method in SIMPLE_MOMOS_METHODS:
+            return {
+                "M": self.M,
+                "Z": None if self.Z is None else self.Z.detach().clone(),
+                "finalized": self.finalized,
+            }
         if self.method not in SOFT_MOMOS_METHODS:
             return {}
         return {
@@ -469,6 +546,10 @@ class QuantizationCallback(L.Callback):
         }
 
     def load_state_dict(self, state_dict):
+        if self.method in SIMPLE_MOMOS_METHODS:
+            self.Z = state_dict.get("Z")
+            self.M = state_dict.get("M")
+            self.finalized = bool(state_dict.get("finalized", False))
         if self.method in SOFT_MOMOS_METHODS:
             self.frozen = bool(state_dict.get("frozen", False))
             self.Z = state_dict.get("Z")
@@ -557,6 +638,7 @@ class QuantizationCallback(L.Callback):
             "hierarchical_momos2d",
             "fold_momos",
             *SOFT_MOMOS_METHODS,
+            *SIMPLE_MOMOS_METHODS,
         ]:
             return
 
@@ -575,6 +657,17 @@ class QuantizationCallback(L.Callback):
                     "active_motifs": float((self._counts > 0).sum()),
                     "lam": float(self.current_lam),
                 }
+            return
+
+        if self.method in SIMPLE_MOMOS_METHODS:
+            self._simple_momos_epoch(pl_module)
+            stats = self._last_quant_stats
+            print(
+                "Simple MoMos applied: "
+                f"distortion={stats['distortion']:.4f} "
+                f"motifs_used={stats['num_motifs_used']} "
+                f"mosaic_changed={stats['mosaic_changed']:.4f}"
+            )
             return
 
         model = pl_module.model
@@ -838,10 +931,10 @@ def _build_quantization_callback(cfg, quant_cfg) -> QuantizationCallback:
     full.pop("enabled", None)
 
     method = full.get("method")
-    if method in ("momos2d", "static_momos2d", *SOFT_MOMOS_METHODS):
+    if method in ("momos2d", "static_momos2d", *SOFT_MOMOS_METHODS, *SIMPLE_MOMOS_METHODS):
         full["s"] = int(full["rows"]) * int(full["cols"])
 
-    if method in ("momos", "momos2d", "static_momos2d", *SOFT_MOMOS_METHODS):
+    if method in ("momos", "momos2d", "static_momos2d", *SOFT_MOMOS_METHODS, *SIMPLE_MOMOS_METHODS):
         if full.get("k") is None and full.get("capacity") is None:
             raise ValueError(f"{method} requires either k or capacity in config")
 

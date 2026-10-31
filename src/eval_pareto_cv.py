@@ -28,11 +28,13 @@ import torch
 
 from model import build_backbone
 from train import build_datamodule, run_training
-from tune_quantization import SOFT_MOMOS_PREFIX, _bump_fd_limit, _suggest_quant_config
+from tune_quantization import SIMPLE_MOMOS_PREFIX, SOFT_MOMOS_PREFIX, _bump_fd_limit, _suggest_quant_config
 from utils.quant_bits import compute_quantization_bits
 
 # Real (non-baseline) methods `_suggest_quant_config` knows how to rebuild.
-_ALL_METHODS = ["momos2d", "qat", "hierarchical_momos2d", "soft_momos", "soft_momos_plus"]
+_ALL_METHODS = [
+    "momos2d", "qat", "hierarchical_momos2d", "soft_momos", "soft_momos_plus", "simple_momos",
+]
 
 _NO_QUANT_METHOD_NAMES = {None, "none", "None", "null", ""}
 
@@ -120,6 +122,10 @@ def _reconstruct_quant_cfg(params: dict, search_space: DictConfig) -> dict:
             pre, soft = SOFT_MOMOS_PREFIX[method], space[method]
             soft.rows = _ensure_categorical_choices(soft.rows, params[f"{pre}_rows"])
             soft.cols = _ensure_categorical_choices(soft.cols, params[f"{pre}_cols"])
+        elif method == "simple_momos":
+            pre, simple = SIMPLE_MOMOS_PREFIX, space.simple_momos
+            simple.rows = _ensure_categorical_choices(simple.rows, params[f"{pre}_rows"])
+            simple.cols = _ensure_categorical_choices(simple.cols, params[f"{pre}_cols"])
         else:
             raise ValueError(
                 f"Unsupported quantization method in pareto entry params: {method!r} "

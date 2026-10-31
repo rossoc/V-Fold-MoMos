@@ -103,8 +103,48 @@ def _suggest_quant_config(
     elif method in SOFT_MOMOS_METHODS:
         return _suggest_soft_momos(trial, search_space[method], method)
 
+    elif method == "simple_momos":
+        return _suggest_simple_momos(trial, search_space.simple_momos)
+
     else:
         raise ValueError(f"Unsupported quantization method for sampling: {method}")
+
+
+# Optuna parameter-name prefix for simple_momos (shared with eval_pareto_cv).
+SIMPLE_MOMOS_PREFIX = "simple"
+
+
+def _suggest_simple_momos(trial: optuna.Trial, space: DictConfig) -> dict:
+    """Sample a simple_momos config.
+
+    Block shape is searched. With a fixed `k` in the space (default 256, like
+    soft_momos, for a direct comparison) compression is set by the block size
+    alone; with `k: null` a `capacity` {low, high, log} block is searched instead.
+    """
+    pre = SIMPLE_MOMOS_PREFIX
+    out = {
+        "enabled": True,
+        "method": "simple_momos",
+        "rows": int(trial.suggest_categorical(f"{pre}_rows", list(space.rows))),
+        "cols": int(trial.suggest_categorical(f"{pre}_cols", list(space.cols))),
+        "force_zero": True,
+        "reseed_dead": bool(space.get("reseed_dead", True)),
+    }
+    if space.get("k") is not None:
+        out["k"] = int(space.k)
+        out["capacity"] = None
+    else:
+        cap_spec = space.capacity
+        out["k"] = None
+        out["capacity"] = float(
+            trial.suggest_float(
+                f"{pre}_capacity",
+                float(cap_spec.low),
+                float(cap_spec.high),
+                log=bool(cap_spec.log),
+            )
+        )
+    return out
 
 
 # Optuna parameter-name prefix per soft-MoMos method (shared with eval_pareto_cv).

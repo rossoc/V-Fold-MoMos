@@ -105,3 +105,9 @@ quant_search_space:
       log: true
     freeze_fraction: 0.1
     lloyd_iters: 1
+
+  simple_momos:
+    rows: [1, 2, 4]
+    cols: [1, 2, 4, 8]
+    k: 256
+    reseed_dead: true
